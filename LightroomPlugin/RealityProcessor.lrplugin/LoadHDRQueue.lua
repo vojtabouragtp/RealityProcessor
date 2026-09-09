@@ -5,7 +5,7 @@ local LrTasks = import 'LrTasks'
 local LrFileUtils = import 'LrFileUtils'
 
 local function homeDir()
-    return os.getenv('HOME') or ''
+    return '/Users/vojtechboura'
 end
 
 local function supportFolder()
