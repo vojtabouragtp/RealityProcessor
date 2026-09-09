@@ -1,5 +1,6 @@
 local LrPathUtils = import 'LrPathUtils'
 local LrTasks = import 'LrTasks'
+local LrFileUtils = import 'LrFileUtils'
 
 local function homeDir()
     return os.getenv('HOME') or ''
@@ -19,23 +20,45 @@ local function triggerPath()
     return LrPathUtils.child(supportFolder(), 'pending_hdr.trigger')
 end
 
-local function loadQueueScript()
-    return LrPathUtils.child(_PLUGIN.path, 'LoadHDRQueue.lua')
+local function heartbeatPath()
+    return LrPathUtils.child(supportFolder(), 'lightroom_bridge.heartbeat')
+end
+
+local function processorPath()
+    return LrPathUtils.child(_PLUGIN.path, 'QueueProcessor.lua')
+end
+
+local function writeHeartbeat(text)
+    local handle = io.open(heartbeatPath(), 'w')
+    if handle then
+        handle:write(text or 'alive')
+        handle:close()
+    end
 end
 
 LrTasks.startAsyncTask(function()
+    writeHeartbeat('started')
+
+    local ok, processor = pcall(dofile, processorPath())
+    if not ok or type(processor) ~= 'function' then
+        writeHeartbeat('processor-load-error:' .. tostring(processor))
+        return
+    end
+
     while true do
+        writeHeartbeat('alive')
         local trigger = triggerPath()
-        local handle = io.open(trigger, 'r')
 
-        if handle then
-            handle:close()
-            os.remove(trigger)
+        if LrFileUtils.exists(trigger) then
+            pcall(function()
+                LrFileUtils.delete(trigger)
+            end)
 
-            local ok, err = pcall(dofile, loadQueueScript())
-            if not ok then
-                -- Menu item remains available as a manual fallback.
-                print('Reality Processor background bridge error: ' .. tostring(err))
+            local success, err = pcall(processor, false)
+            if not success then
+                writeHeartbeat('processor-error:' .. tostring(err))
+            else
+                writeHeartbeat('processed')
             end
         end
 
