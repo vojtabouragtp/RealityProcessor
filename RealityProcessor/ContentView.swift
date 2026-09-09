@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var result: ScanResult?
     @State private var isScanning = false
     @State private var errorMessage: String?
+    @State private var statusMessage: String?
     @State private var isDropTargeted = false
     @State private var bracketMode: BracketMode = .automatic
 
@@ -34,7 +35,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.6")
+                Text("HDR workflow · v0.7")
                     .foregroundStyle(.secondary)
             }
 
@@ -85,9 +86,24 @@ struct ContentView: View {
             .controlSize(.large)
             .disabled(sourceFolder == nil || isScanning)
 
+            Button(action: prepareLightroom) {
+                Label("Připravit Lightroom HDR", systemImage: "wand.and.rays")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .disabled(result?.brackets.isEmpty != false)
+
+            if let statusMessage {
+                Text(statusMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Spacer()
 
-            Text("Teď řešíme pouze ingest + detekci HDR sérií. Lightroom přijde jako další modul.")
+            Text("v0.7: připraví HDR frontu pro Lightroom Classic. Samotné Photo Merge spouští Lightroom plugin.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -144,6 +160,7 @@ struct ContentView: View {
                 guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else { return false }
                 sourceFolder = folder
                 result = nil
+                statusMessage = nil
                 return true
             } isTargeted: { targeted in
                 isDropTargeted = targeted
@@ -160,6 +177,7 @@ struct ContentView: View {
         if panel.runModal() == .OK {
             sourceFolder = panel.url
             result = nil
+            statusMessage = nil
         }
     }
 
@@ -167,6 +185,7 @@ struct ContentView: View {
         guard let sourceFolder else { return }
         isScanning = true
         errorMessage = nil
+        statusMessage = nil
         Task {
             do {
                 let scan = try await scanner.scan(folder: sourceFolder, mode: bracketMode)
@@ -180,6 +199,85 @@ struct ContentView: View {
                     isScanning = false
                 }
             }
+        }
+    }
+
+    private func prepareLightroom() {
+        guard let result, !result.brackets.isEmpty else { return }
+
+        do {
+            let manifestURL = try LightroomBridge.writeManifest(for: result)
+            statusMessage = "HDR fronta připravena: \(result.brackets.count) sérií. Otevírám Lightroom Classic…"
+            LightroomBridge.openLightroomClassic()
+
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(manifestURL.path(percentEncoded: false), forType: .string)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private enum LightroomBridge {
+    static func writeManifest(for result: ScanResult) throws -> URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let folder = appSupport.appendingPathComponent("RealityProcessor", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+        let manifestURL = folder.appendingPathComponent("pending_hdr.lua")
+
+        func luaString(_ value: String) -> String {
+            let escaped = value
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
+        }
+
+        let groupBlocks = result.brackets.enumerated().map { index, group in
+            let paths = group.photos
+                .map { luaString($0.url.path(percentEncoded: false)) }
+                .joined(separator: ",\n            ")
+
+            return """
+        {
+            index = \(index + 1),
+            preset = \(luaString(group.presetName)),
+            paths = {
+                \(paths)
+            }
+        }
+"""
+        }.joined(separator: ",\n")
+
+        let lua = """
+return {
+    version = 1,
+    createdAt = \(luaString(ISO8601DateFormatter().string(from: Date()))),
+    groups = {
+\(groupBlocks)
+    }
+}
+"""
+
+        try lua.write(to: manifestURL, atomically: true, encoding: .utf8)
+        return manifestURL
+    }
+
+    static func openLightroomClassic() {
+        let workspace = NSWorkspace.shared
+        let candidates = [
+            "/Applications/Adobe Lightroom Classic/Adobe Lightroom Classic.app",
+            "/Applications/Adobe Lightroom Classic.app"
+        ]
+
+        for path in candidates where FileManager.default.fileExists(atPath: path) {
+            workspace.openApplication(at: URL(fileURLWithPath: path), configuration: .init())
+            return
+        }
+
+        if let appURL = workspace.urlForApplication(withBundleIdentifier: "com.adobe.LightroomClassicCC7") {
+            workspace.openApplication(at: appURL, configuration: .init())
         }
     }
 }
