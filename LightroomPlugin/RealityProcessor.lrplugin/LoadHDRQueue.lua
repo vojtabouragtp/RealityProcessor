@@ -66,19 +66,6 @@ local function loadManifest(path)
     return manifest, nil
 end
 
-local function ensurePhoto(catalog, path)
-    local photo = catalog:findPhotoByPath(path)
-    if photo then
-        return photo
-    end
-
-    local imported
-    catalog:withWriteAccessDo('Reality Processor import', function()
-        imported = catalog:addPhoto(path)
-    end)
-    return imported
-end
-
 local function processQueue(showDialog)
     local manifest, err = loadManifest(manifestPath())
     if not manifest then
@@ -99,11 +86,37 @@ local function processQueue(showDialog)
 
     local catalog = LrApplication.activeCatalog()
     local importedCount = 0
+    local missingPaths = {}
 
+    -- Nejprve sesbíráme jen fotky, které ještě v katalogu nejsou.
+    -- Import pak proběhne v jednom write-access bloku místo desítek samostatných importů.
     for _, group in ipairs(manifest.groups) do
         group.photos = {}
         for _, photoPath in ipairs(group.paths or {}) do
-            local photo = ensurePhoto(catalog, photoPath)
+            local photo = catalog:findPhotoByPath(photoPath)
+            if photo then
+                table.insert(group.photos, photo)
+                importedCount = importedCount + 1
+            else
+                table.insert(missingPaths, photoPath)
+            end
+        end
+    end
+
+    if #missingPaths > 0 then
+        catalog:withWriteAccessDo('Reality Processor import', function()
+            for _, photoPath in ipairs(missingPaths) do
+                catalog:addPhoto(photoPath)
+            end
+        end)
+    end
+
+    -- Po importu znovu sestavíme skupiny z objektů LrPhoto.
+    importedCount = 0
+    for _, group in ipairs(manifest.groups) do
+        group.photos = {}
+        for _, photoPath in ipairs(group.paths or {}) do
+            local photo = catalog:findPhotoByPath(photoPath)
             if photo then
                 table.insert(group.photos, photo)
                 importedCount = importedCount + 1
@@ -135,8 +148,6 @@ local function processQueue(showDialog)
     return true
 end
 
--- Tento soubor je zároveň init skript i ruční menu akce.
--- Používáme jen tento jeden existující .lua soubor, aby Lightroom nemusel hledat nové pomocné skripty.
 if not _G.RealityProcessorBridgeStarted then
     _G.RealityProcessorBridgeStarted = true
 
@@ -152,10 +163,15 @@ if not _G.RealityProcessorBridgeStarted then
                     LrFileUtils.delete(trigger)
                 end)
 
-                local ok, err = pcall(processQueue, false)
+                -- Nepoužívat obyčejné Lua pcall kolem processQueue.
+                -- Lightroom katalogové operace mohou yieldovat a přes C pcall hranici to padá
+                -- na "Yielding is not allowed within a C or metamethod call".
+                local ok, result = LrTasks.pcall(processQueue, false)
                 if not ok then
-                    writeHeartbeat('processor-error:' .. tostring(err))
-                    writeAck('ERROR: ' .. tostring(err))
+                    writeHeartbeat('processor-error:' .. tostring(result))
+                    writeAck('ERROR: ' .. tostring(result))
+                elseif result == false then
+                    writeHeartbeat('processor-failed')
                 end
             end
 
@@ -164,14 +180,18 @@ if not _G.RealityProcessorBridgeStarted then
     end)
 end
 
--- Když je skript spuštěn ručně z Plug-in Extras a fronta už čeká,
--- zpracuj ji ihned místo čekání na další tick watcheru.
 LrTasks.startAsyncTask(function()
     local trigger = triggerPath()
     if LrFileUtils.exists(trigger) then
         pcall(function()
             LrFileUtils.delete(trigger)
         end)
-        processQueue(true)
+
+        local ok, result = LrTasks.pcall(processQueue, true)
+        if not ok then
+            writeHeartbeat('processor-error:' .. tostring(result))
+            writeAck('ERROR: ' .. tostring(result))
+            LrDialogs.message('Reality Processor', tostring(result), 'critical')
+        end
     end
 end)
