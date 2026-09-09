@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ApplicationServices
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -36,7 +37,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.9")
+                Text("HDR workflow · v0.10")
                     .foregroundStyle(.secondary)
             }
 
@@ -110,7 +111,7 @@ struct ContentView: View {
 
             Spacer()
 
-            Text("v0.9: otevírá Lightroom Classic a cíleně spouští Library → Plug-in Extras → Reality Processor.")
+            Text("v0.10: Lightroom automatizace běží přímo pod Reality Processorem, ne přes samostatný osascript proces.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -293,10 +294,18 @@ return {
     static func openAndRunPlugin(completion: @escaping (LightroomLaunchResult) -> Void) {
         openLightroomClassic()
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            Thread.sleep(forTimeInterval: 3.0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+            let options = [promptKey: true] as CFDictionary
 
-            let script = #"""
+            guard AXIsProcessTrustedWithOptions(options) else {
+                completion(.failure(
+                    "Reality Processor nemá aktivní oprávnění Zpřístupnění. V Nastavení systému → Soukromí a zabezpečení → Zpřístupnění Reality Processor vypni a znovu zapni, potom aplikaci úplně ukonči a znovu spusť."
+                ))
+                return
+            }
+
+            let scriptSource = #"""
             tell application "Adobe Lightroom Classic" to activate
             delay 1
 
@@ -315,109 +324,61 @@ return {
                 end if
 
                 tell lrProcess
-                    set targetName to "Reality Processor: Načíst HDR frontu"
-
-                    -- Lightroom SDK LrLibraryMenuItems se zobrazuje v Library → Plug-in Extras.
                     try
-                        click menu bar item "Library" of menu bar 1
-                        delay 0.25
-                        tell menu 1 of menu bar item "Library" of menu bar 1
-                            if exists menu item "Plug-in Extras" then
-                                tell menu item "Plug-in Extras"
-                                    delay 0.2
-                                    if exists menu 1 then
-                                        tell menu 1
-                                            if exists menu item targetName then
-                                                click menu item targetName
-                                                return "OK"
-                                            end if
-                                        end tell
-                                    end if
-                                end tell
-                            end if
-                        end tell
+                        set libraryMenu to menu 1 of menu bar item "Library" of menu bar 1
+                    on error
+                        error "Menu Library nebylo nalezeno."
                     end try
 
-                    -- Některé verze Lightroomu mohou Plug-in Extras ukázat pod File.
                     try
-                        click menu bar item "File" of menu bar 1
-                        delay 0.25
-                        tell menu 1 of menu bar item "File" of menu bar 1
-                            if exists menu item "Plug-in Extras" then
-                                tell menu item "Plug-in Extras"
-                                    delay 0.2
-                                    if exists menu 1 then
-                                        tell menu 1
-                                            if exists menu item targetName then
-                                                click menu item targetName
-                                                return "OK"
-                                            end if
-                                        end tell
-                                    end if
-                                end tell
-                            end if
-                        end tell
+                        set pluginExtrasItem to menu item "Plug-in Extras" of libraryMenu
+                    on error
+                        error "Library → Plug-in Extras nebylo nalezeno."
                     end try
 
-                    -- Poslední fallback: projdi hlavní menu a jejich první dvě úrovně.
-                    repeat with topItem in menu bar items of menu bar 1
+                    try
+                        set pluginExtrasMenu to menu 1 of pluginExtrasItem
+                    on error
+                        error "Podmenu Plug-in Extras se nepodařilo otevřít."
+                    end try
+
+                    repeat with pluginItem in menu items of pluginExtrasMenu
                         try
-                            click topItem
-                            delay 0.1
-                            set topMenu to menu 1 of topItem
-                            repeat with menuItemRef in menu items of topMenu
-                                try
-                                    if (name of menuItemRef as text) is targetName then
-                                        click menuItemRef
-                                        return "OK"
-                                    end if
-                                end try
-                                try
-                                    if exists menu 1 of menuItemRef then
-                                        repeat with subItem in menu items of menu 1 of menuItemRef
-                                            try
-                                                if (name of subItem as text) is targetName then
-                                                    click subItem
-                                                    return "OK"
-                                                end if
-                                            end try
-                                        end repeat
-                                    end if
-                                end try
-                            end repeat
+                            if (name of pluginItem as text) is "Reality Processor: Načíst HDR frontu" then
+                                click pluginItem
+                                return "OK"
+                            end if
                         end try
                     end repeat
                 end tell
             end tell
 
-            error "Plugin je nainstalovaný, ale jeho menu položku se nepodařilo přes macOS UI najít. Zkus v Lightroomu ručně Library → Plug-in Extras a ověř, že tam je Reality Processor: Načíst HDR frontu."
+            error "Reality Processor: Načíst HDR frontu nebylo v Library → Plug-in Extras nalezeno."
             """#
 
-            let process = Process()
-            let output = Pipe()
-            let errorOutput = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", script]
-            process.standardOutput = output
-            process.standardError = errorOutput
+            guard let appleScript = NSAppleScript(source: scriptSource) else {
+                completion(.failure("Nepodařilo se vytvořit AppleScript pro Lightroom."))
+                return
+            }
 
-            do {
-                try process.run()
-                process.waitUntilExit()
+            var scriptError: NSDictionary?
+            let result = appleScript.executeAndReturnError(&scriptError)
 
-                if process.terminationStatus == 0 {
-                    completion(.success)
-                } else {
-                    let data = errorOutput.fileHandleForReading.readDataToEndOfFile()
-                    let detail = String(data: data, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    let message = detail?.isEmpty == false ? detail! : "Automatizace Lightroomu selhala."
-                    completion(.failure(
-                        message + "\n\nPokud macOS zobrazí žádost o oprávnění, povol Reality Processor/osascript v Nastavení systému → Soukromí a zabezpečení → Zpřístupnění."
-                    ))
-                }
-            } catch {
-                completion(.failure("Nepodařilo se spustit macOS automatizaci: \(error.localizedDescription)"))
+            if let scriptError {
+                let message = (scriptError[NSAppleScript.errorMessage] as? String)
+                    ?? "Automatizace Lightroomu selhala."
+                let number = scriptError[NSAppleScript.errorNumber] as? Int
+                let suffix = number.map { " (\($0))" } ?? ""
+                completion(.failure(
+                    message + suffix + "\n\nPokud se zobrazí dotaz, povol Reality Processor také v Nastavení systému → Soukromí a zabezpečení → Automatizace pro System Events a Adobe Lightroom Classic."
+                ))
+                return
+            }
+
+            if result.stringValue == "OK" {
+                completion(.success)
+            } else {
+                completion(.failure("Lightroom automatizace skončila bez potvrzení spuštění pluginu."))
             }
         }
     }
