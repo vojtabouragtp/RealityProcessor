@@ -3,7 +3,7 @@ return {
     LrSdkMinimumVersion = 3.0,
     LrToolkitIdentifier = 'com.vojtaboura.realityprocessor',
     LrPluginName = 'Reality Processor',
-    VERSION = { major = 1, minor = 2, revision = 0, build = 0 },
+    VERSION = { major = 1, minor = 3, revision = 0, build = 0 },
 
     LrInitPlugin = 'Init.lua',
 
