@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import ApplicationServices
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -37,7 +36,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.11")
+                Text("HDR workflow · v0.12")
                     .foregroundStyle(.secondary)
             }
 
@@ -111,7 +110,7 @@ struct ContentView: View {
 
             Spacer()
 
-            Text("v0.11: automatizace hledá Reality Processor v Plug-in Extras pod File i Library.")
+            Text("v0.12: bez Accessibility. Lightroom plugin si HDR frontu vyzvedne sám na pozadí.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -214,24 +213,19 @@ struct ContentView: View {
         guard let result, !result.brackets.isEmpty else { return }
 
         do {
-            let manifestURL = try LightroomBridge.writeManifest(for: result)
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(manifestURL.path(percentEncoded: false), forType: .string)
-
+            _ = try LightroomBridge.writeManifest(for: result)
             isPreparingLightroom = true
             errorMessage = nil
-            statusMessage = "HDR fronta připravena: \(result.brackets.count) sérií. Spouštím Lightroom plugin…"
+            statusMessage = "HDR fronta připravena: \(result.brackets.count) sérií. Otevírám Lightroom…"
 
             LightroomBridge.openAndRunPlugin { outcome in
                 DispatchQueue.main.async {
                     isPreparingLightroom = false
                     switch outcome {
                     case .success:
-                        statusMessage = "Lightroom plugin spuštěn. Lightroom teď načítá RAWy a vybírá první HDR sérii."
+                        statusMessage = "Fronta předána Lightroomu. Plugin ji automaticky zpracuje na pozadí."
                     case .failure(let message):
                         errorMessage = message
-                        statusMessage = "Fronta je připravená, ale plugin se nepodařilo automaticky spustit."
                     }
                 }
             }
@@ -253,6 +247,7 @@ private enum LightroomBridge {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
         let manifestURL = folder.appendingPathComponent("pending_hdr.lua")
+        let triggerURL = folder.appendingPathComponent("pending_hdr.trigger")
 
         func luaString(_ value: String) -> String {
             let escaped = value
@@ -279,7 +274,7 @@ private enum LightroomBridge {
 
         let lua = """
 return {
-    version = 1,
+    version = 2,
     createdAt = \(luaString(ISO8601DateFormatter().string(from: Date()))),
     groups = {
 \(groupBlocks)
@@ -288,95 +283,23 @@ return {
 """
 
         try lua.write(to: manifestURL, atomically: true, encoding: .utf8)
+        try ISO8601DateFormatter().string(from: Date()).write(to: triggerURL, atomically: true, encoding: .utf8)
         return manifestURL
     }
 
     static func openAndRunPlugin(completion: @escaping (LightroomLaunchResult) -> Void) {
-        openLightroomClassic()
+        guard openLightroomClassic() else {
+            completion(.failure("Adobe Lightroom Classic nebyl nalezen v Applications."))
+            return
+        }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-            let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-            let options = [promptKey: true] as CFDictionary
-
-            guard AXIsProcessTrustedWithOptions(options) else {
-                completion(.failure(
-                    "Reality Processor nemá aktivní oprávnění Zpřístupnění. V Nastavení systému → Soukromí a zabezpečení → Zpřístupnění Reality Processor vypni a znovu zapni, potom aplikaci úplně ukonči a znovu spusť."
-                ))
-                return
-            }
-
-            let scriptSource = #"""
-            tell application "Adobe Lightroom Classic" to activate
-            delay 1
-
-            tell application "System Events"
-                set lrProcess to missing value
-                repeat 30 times
-                    try
-                        set lrProcess to first application process whose name contains "Lightroom Classic"
-                        exit repeat
-                    end try
-                    delay 0.5
-                end repeat
-
-                if lrProcess is missing value then
-                    error "Proces Adobe Lightroom Classic nebyl nalezen."
-                end if
-
-                tell lrProcess
-                    set targetName to "Reality Processor: Načíst HDR frontu"
-                    set topMenus to {"File", "Library"}
-
-                    repeat with topMenuName in topMenus
-                        try
-                            set topMenu to menu 1 of menu bar item (topMenuName as text) of menu bar 1
-                            set pluginExtrasItem to menu item "Plug-in Extras" of topMenu
-                            click pluginExtrasItem
-                            delay 0.2
-                            set pluginExtrasMenu to menu 1 of pluginExtrasItem
-
-                            repeat with pluginItem in menu items of pluginExtrasMenu
-                                try
-                                    if (name of pluginItem as text) is targetName then
-                                        click pluginItem
-                                        return "OK"
-                                    end if
-                                end try
-                            end repeat
-                        end try
-                    end repeat
-                end tell
-            end tell
-
-            error "Reality Processor: Načíst HDR frontu nebylo nalezeno v Plug-in Extras pod File ani Library."
-            """#
-
-            guard let appleScript = NSAppleScript(source: scriptSource) else {
-                completion(.failure("Nepodařilo se vytvořit AppleScript pro Lightroom."))
-                return
-            }
-
-            var scriptError: NSDictionary?
-            let result = appleScript.executeAndReturnError(&scriptError)
-
-            if let scriptError {
-                let message = (scriptError[NSAppleScript.errorMessage] as? String)
-                    ?? "Automatizace Lightroomu selhala."
-                let number = scriptError[NSAppleScript.errorNumber] as? Int
-                let suffix = number.map { " (\($0))" } ?? ""
-                completion(.failure(message + suffix))
-                return
-            }
-
-            if result.stringValue == "OK" {
-                completion(.success)
-            } else {
-                completion(.failure("Lightroom automatizace skončila bez potvrzení spuštění pluginu."))
-            }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            completion(.success)
         }
     }
 
-    static func openLightroomClassic() {
+    @discardableResult
+    static func openLightroomClassic() -> Bool {
         let workspace = NSWorkspace.shared
         let candidates = [
             "/Applications/Adobe Lightroom Classic/Adobe Lightroom Classic.app",
@@ -385,12 +308,15 @@ return {
 
         for path in candidates where FileManager.default.fileExists(atPath: path) {
             workspace.openApplication(at: URL(fileURLWithPath: path), configuration: .init())
-            return
+            return true
         }
 
         if let appURL = workspace.urlForApplication(withBundleIdentifier: "com.adobe.LightroomClassicCC7") {
             workspace.openApplication(at: appURL, configuration: .init())
+            return true
         }
+
+        return false
     }
 }
 
