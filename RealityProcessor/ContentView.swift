@@ -6,6 +6,7 @@ struct ContentView: View {
     @State private var sourceFolder: URL?
     @State private var result: ScanResult?
     @State private var isScanning = false
+    @State private var isPreparingLightroom = false
     @State private var errorMessage: String?
     @State private var statusMessage: String?
     @State private var isDropTargeted = false
@@ -35,7 +36,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.7")
+                Text("HDR workflow · v0.8")
                     .foregroundStyle(.secondary)
             }
 
@@ -84,15 +85,21 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(sourceFolder == nil || isScanning)
+            .disabled(sourceFolder == nil || isScanning || isPreparingLightroom)
 
             Button(action: prepareLightroom) {
-                Label("Připravit Lightroom HDR", systemImage: "wand.and.rays")
-                    .frame(maxWidth: .infinity)
+                HStack {
+                    if isPreparingLightroom { ProgressView().controlSize(.small) }
+                    Label(
+                        isPreparingLightroom ? "Spouštím Lightroom…" : "Připravit Lightroom HDR",
+                        systemImage: "wand.and.rays"
+                    )
+                }
+                .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
-            .disabled(result?.brackets.isEmpty != false)
+            .disabled(result?.brackets.isEmpty != false || isPreparingLightroom)
 
             if let statusMessage {
                 Text(statusMessage)
@@ -103,7 +110,7 @@ struct ContentView: View {
 
             Spacer()
 
-            Text("v0.7: připraví HDR frontu pro Lightroom Classic. Samotné Photo Merge spouští Lightroom plugin.")
+            Text("v0.8: připraví HDR frontu, otevře Lightroom Classic a automaticky spustí Reality Processor plugin.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -207,16 +214,35 @@ struct ContentView: View {
 
         do {
             let manifestURL = try LightroomBridge.writeManifest(for: result)
-            statusMessage = "HDR fronta připravena: \(result.brackets.count) sérií. Otevírám Lightroom Classic…"
-            LightroomBridge.openLightroomClassic()
-
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(manifestURL.path(percentEncoded: false), forType: .string)
+
+            isPreparingLightroom = true
+            errorMessage = nil
+            statusMessage = "HDR fronta připravena: \(result.brackets.count) sérií. Spouštím Lightroom plugin…"
+
+            LightroomBridge.openAndRunPlugin { outcome in
+                DispatchQueue.main.async {
+                    isPreparingLightroom = false
+                    switch outcome {
+                    case .success:
+                        statusMessage = "Lightroom plugin spuštěn. Lightroom teď načítá RAWy a vybírá první HDR sérii."
+                    case .failure(let message):
+                        errorMessage = message
+                        statusMessage = "Fronta je připravená, ale plugin se nepodařilo automaticky spustit."
+                    }
+                }
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
     }
+}
+
+private enum LightroomLaunchResult {
+    case success
+    case failure(String)
 }
 
 private enum LightroomBridge {
@@ -262,6 +288,93 @@ return {
 
         try lua.write(to: manifestURL, atomically: true, encoding: .utf8)
         return manifestURL
+    }
+
+    static func openAndRunPlugin(completion: @escaping (LightroomLaunchResult) -> Void) {
+        openLightroomClassic()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Lightroomu necháme čas na otevření katalogu a menu pluginů.
+            Thread.sleep(forTimeInterval: 3.0)
+
+            let script = #"""
+            tell application "Adobe Lightroom Classic" to activate
+            delay 1
+
+            tell application "System Events"
+                set lrProcess to missing value
+                repeat 30 times
+                    try
+                        set lrProcess to first application process whose name contains "Lightroom Classic"
+                        exit repeat
+                    end try
+                    delay 0.5
+                end repeat
+
+                if lrProcess is missing value then
+                    error "Proces Adobe Lightroom Classic nebyl nalezen."
+                end if
+
+                tell lrProcess
+                    set targetName to "Reality Processor: Načíst HDR frontu"
+                    repeat with topItem in menu bar items of menu bar 1
+                        try
+                            set topMenu to menu 1 of topItem
+                            repeat with menuItemRef in menu items of topMenu
+                                try
+                                    if (name of menuItemRef as text) is targetName then
+                                        click menuItemRef
+                                        return "OK"
+                                    end if
+                                end try
+
+                                try
+                                    set subMenu to menu 1 of menuItemRef
+                                    repeat with subItem in menu items of subMenu
+                                        try
+                                            if (name of subItem as text) is targetName then
+                                                click subItem
+                                                return "OK"
+                                            end if
+                                        end try
+                                    end repeat
+                                end try
+                            end repeat
+                        end try
+                    end repeat
+                end tell
+            end tell
+
+            error "Položka Reality Processor pluginu nebyla v menu Lightroomu nalezena. Ověř, že je plugin nainstalovaný a aktivní v File → Plug-in Manager."
+            """#
+
+            let process = Process()
+            let output = Pipe()
+            let errorOutput = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", script]
+            process.standardOutput = output
+            process.standardError = errorOutput
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+
+                if process.terminationStatus == 0 {
+                    completion(.success)
+                } else {
+                    let data = errorOutput.fileHandleForReading.readDataToEndOfFile()
+                    let detail = String(data: data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let message = detail?.isEmpty == false ? detail! : "Automatizace Lightroomu selhala."
+                    completion(.failure(
+                        message + "\n\nPokud macOS zobrazí žádost o oprávnění, povol Reality Processor/osascript v Nastavení systému → Soukromí a zabezpečení → Zpřístupnění."
+                    ))
+                }
+            } catch {
+                completion(.failure("Nepodařilo se spustit macOS automatizaci: \(error.localizedDescription)"))
+            }
+        }
     }
 
     static func openLightroomClassic() {
