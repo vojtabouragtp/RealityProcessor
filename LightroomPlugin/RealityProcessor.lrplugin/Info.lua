@@ -3,10 +3,10 @@ return {
     LrSdkMinimumVersion = 3.0,
     LrToolkitIdentifier = 'com.vojtaboura.realityprocessor',
     LrPluginName = 'Reality Processor',
-    VERSION = { major = 1, minor = 4, revision = 0, build = 0 },
+    VERSION = { major = 1, minor = 5, revision = 0, build = 0 },
 
-    -- Force Lightroom to run Init.lua immediately when the plug-in is loaded.
-    LrInitPlugin = 'Init.lua',
+    -- Force Lightroom to run the background bridge immediately when the plug-in is loaded.
+    LrInitPlugin = 'PluginInit.lua',
     LrForceInitPlugin = true,
 
     LrLibraryMenuItems = {
