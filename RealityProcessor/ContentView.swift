@@ -36,7 +36,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.8")
+                Text("HDR workflow · v0.9")
                     .foregroundStyle(.secondary)
             }
 
@@ -110,7 +110,7 @@ struct ContentView: View {
 
             Spacer()
 
-            Text("v0.8: připraví HDR frontu, otevře Lightroom Classic a automaticky spustí Reality Processor plugin.")
+            Text("v0.9: otevírá Lightroom Classic a cíleně spouští Library → Plug-in Extras → Reality Processor.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -294,7 +294,6 @@ return {
         openLightroomClassic()
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // Lightroomu necháme čas na otevření katalogu a menu pluginů.
             Thread.sleep(forTimeInterval: 3.0)
 
             let script = #"""
@@ -317,8 +316,54 @@ return {
 
                 tell lrProcess
                     set targetName to "Reality Processor: Načíst HDR frontu"
+
+                    -- Lightroom SDK LrLibraryMenuItems se zobrazuje v Library → Plug-in Extras.
+                    try
+                        click menu bar item "Library" of menu bar 1
+                        delay 0.25
+                        tell menu 1 of menu bar item "Library" of menu bar 1
+                            if exists menu item "Plug-in Extras" then
+                                tell menu item "Plug-in Extras"
+                                    delay 0.2
+                                    if exists menu 1 then
+                                        tell menu 1
+                                            if exists menu item targetName then
+                                                click menu item targetName
+                                                return "OK"
+                                            end if
+                                        end tell
+                                    end if
+                                end tell
+                            end if
+                        end tell
+                    end try
+
+                    -- Některé verze Lightroomu mohou Plug-in Extras ukázat pod File.
+                    try
+                        click menu bar item "File" of menu bar 1
+                        delay 0.25
+                        tell menu 1 of menu bar item "File" of menu bar 1
+                            if exists menu item "Plug-in Extras" then
+                                tell menu item "Plug-in Extras"
+                                    delay 0.2
+                                    if exists menu 1 then
+                                        tell menu 1
+                                            if exists menu item targetName then
+                                                click menu item targetName
+                                                return "OK"
+                                            end if
+                                        end tell
+                                    end if
+                                end tell
+                            end if
+                        end tell
+                    end try
+
+                    -- Poslední fallback: projdi hlavní menu a jejich první dvě úrovně.
                     repeat with topItem in menu bar items of menu bar 1
                         try
+                            click topItem
+                            delay 0.1
                             set topMenu to menu 1 of topItem
                             repeat with menuItemRef in menu items of topMenu
                                 try
@@ -327,17 +372,17 @@ return {
                                         return "OK"
                                     end if
                                 end try
-
                                 try
-                                    set subMenu to menu 1 of menuItemRef
-                                    repeat with subItem in menu items of subMenu
-                                        try
-                                            if (name of subItem as text) is targetName then
-                                                click subItem
-                                                return "OK"
-                                            end if
-                                        end try
-                                    end repeat
+                                    if exists menu 1 of menuItemRef then
+                                        repeat with subItem in menu items of menu 1 of menuItemRef
+                                            try
+                                                if (name of subItem as text) is targetName then
+                                                    click subItem
+                                                    return "OK"
+                                                end if
+                                            end try
+                                        end repeat
+                                    end if
                                 end try
                             end repeat
                         end try
@@ -345,7 +390,7 @@ return {
                 end tell
             end tell
 
-            error "Položka Reality Processor pluginu nebyla v menu Lightroomu nalezena. Ověř, že je plugin nainstalovaný a aktivní v File → Plug-in Manager."
+            error "Plugin je nainstalovaný, ale jeho menu položku se nepodařilo přes macOS UI najít. Zkus v Lightroomu ručně Library → Plug-in Extras a ověř, že tam je Reality Processor: Načíst HDR frontu."
             """#
 
             let process = Process()
