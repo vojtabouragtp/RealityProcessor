@@ -60,7 +60,6 @@ final class PhotoScanner {
         let exposureTime = number(exif?[kCGImagePropertyExifExposureTime])
         let fNumber = number(exif?[kCGImagePropertyExifFNumber])
         let iso = isoNumber(exif?[kCGImagePropertyExifISOSpeedRatings])
-            ?? number(exif?[kCGImagePropertyExifPhotographicSensitivity])
 
         let captureDate = parseExifDate(exif?[kCGImagePropertyExifDateTimeOriginal])
             ?? parseExifDate(tiff?[kCGImagePropertyTIFFDateTime])
