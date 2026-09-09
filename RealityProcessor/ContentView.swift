@@ -36,7 +36,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.12")
+                Text("HDR workflow · v0.13")
                     .foregroundStyle(.secondary)
             }
 
@@ -91,7 +91,7 @@ struct ContentView: View {
                 HStack {
                     if isPreparingLightroom { ProgressView().controlSize(.small) }
                     Label(
-                        isPreparingLightroom ? "Spouštím Lightroom…" : "Připravit Lightroom HDR",
+                        isPreparingLightroom ? "Čekám na Lightroom…" : "Připravit Lightroom HDR",
                         systemImage: "wand.and.rays"
                     )
                 }
@@ -110,7 +110,7 @@ struct ContentView: View {
 
             Spacer()
 
-            Text("v0.12: bez Accessibility. Lightroom plugin si HDR frontu vyzvedne sám na pozadí.")
+            Text("v0.13: kontroluje, že Lightroom bridge skutečně převzal HDR frontu.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -140,7 +140,7 @@ struct ContentView: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 0) {
-                            ForEach(result.brackets, id: \BracketGroup.id) { (group: BracketGroup) in
+                            ForEach(result.brackets, id: \BracketGroup.id) { group in
                                 BracketRow(group: group)
                                 Divider()
                             }
@@ -213,19 +213,21 @@ struct ContentView: View {
         guard let result, !result.brackets.isEmpty else { return }
 
         do {
+            try LightroomBridge.clearAck()
             _ = try LightroomBridge.writeManifest(for: result)
             isPreparingLightroom = true
             errorMessage = nil
-            statusMessage = "HDR fronta připravena: \(result.brackets.count) sérií. Otevírám Lightroom…"
+            statusMessage = "HDR fronta připravena. Čekám, až ji Lightroom plugin převezme…"
 
-            LightroomBridge.openAndRunPlugin { outcome in
+            LightroomBridge.openAndWaitForPlugin { outcome in
                 DispatchQueue.main.async {
                     isPreparingLightroom = false
                     switch outcome {
-                    case .success:
-                        statusMessage = "Fronta předána Lightroomu. Plugin ji automaticky zpracuje na pozadí."
+                    case .success(let detail):
+                        statusMessage = detail
                     case .failure(let message):
                         errorMessage = message
+                        statusMessage = "Lightroom frontu nepřevzal."
                     }
                 }
             }
@@ -236,18 +238,36 @@ struct ContentView: View {
 }
 
 private enum LightroomLaunchResult {
-    case success
+    case success(String)
     case failure(String)
 }
 
 private enum LightroomBridge {
-    static func writeManifest(for result: ScanResult) throws -> URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let folder = appSupport.appendingPathComponent("RealityProcessor", isDirectory: true)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    private static var supportFolder: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("RealityProcessor", isDirectory: true)
+    }
 
-        let manifestURL = folder.appendingPathComponent("pending_hdr.lua")
-        let triggerURL = folder.appendingPathComponent("pending_hdr.trigger")
+    private static var ackURL: URL {
+        supportFolder.appendingPathComponent("pending_hdr.ack")
+    }
+
+    private static var heartbeatURL: URL {
+        supportFolder.appendingPathComponent("lightroom_bridge.heartbeat")
+    }
+
+    static func clearAck() throws {
+        try FileManager.default.createDirectory(at: supportFolder, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: ackURL.path) {
+            try FileManager.default.removeItem(at: ackURL)
+        }
+    }
+
+    static func writeManifest(for result: ScanResult) throws -> URL {
+        try FileManager.default.createDirectory(at: supportFolder, withIntermediateDirectories: true)
+
+        let manifestURL = supportFolder.appendingPathComponent("pending_hdr.lua")
+        let triggerURL = supportFolder.appendingPathComponent("pending_hdr.trigger")
 
         func luaString(_ value: String) -> String {
             let escaped = value
@@ -274,7 +294,7 @@ private enum LightroomBridge {
 
         let lua = """
 return {
-    version = 2,
+    version = 3,
     createdAt = \(luaString(ISO8601DateFormatter().string(from: Date()))),
     groups = {
 \(groupBlocks)
@@ -287,14 +307,41 @@ return {
         return manifestURL
     }
 
-    static func openAndRunPlugin(completion: @escaping (LightroomLaunchResult) -> Void) {
+    static func openAndWaitForPlugin(completion: @escaping (LightroomLaunchResult) -> Void) {
         guard openLightroomClassic() else {
             completion(.failure("Adobe Lightroom Classic nebyl nalezen v Applications."))
             return
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            completion(.success)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let deadline = Date().addingTimeInterval(12)
+
+            while Date() < deadline {
+                if let ack = try? String(contentsOf: ackURL, encoding: .utf8) {
+                    let text = ack.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if text.hasPrefix("OK|") {
+                        let parts = text.split(separator: "|")
+                        let groups = parts.count > 1 ? String(parts[1]) : "?"
+                        let raws = parts.count > 2 ? String(parts[2]) : "?"
+                        completion(.success("Lightroom převzal frontu: \(groups) HDR sérií / \(raws) RAWů. První série je vybraná."))
+                        return
+                    }
+                    if text.hasPrefix("ERROR:") {
+                        completion(.failure("Lightroom plugin vrátil chybu: \(text)"))
+                        return
+                    }
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+
+            let heartbeat = (try? String(contentsOf: heartbeatURL, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if let heartbeat, !heartbeat.isEmpty {
+                completion(.failure("Lightroom plugin běží, ale HDR trigger nezpracoval. Stav bridge: \(heartbeat). V Plug-in Manageru ověř verzi 1.3 a dej Disable → Enable."))
+            } else {
+                completion(.failure("Lightroom bridge se vůbec nespustil. V Plug-in Manageru ověř Reality Processor verzi 1.3 a dej Disable → Enable, případně Remove → Add."))
+            }
         }
     }
 
