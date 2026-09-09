@@ -37,7 +37,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.10")
+                Text("HDR workflow · v0.11")
                     .foregroundStyle(.secondary)
             }
 
@@ -111,7 +111,7 @@ struct ContentView: View {
 
             Spacer()
 
-            Text("v0.10: Lightroom automatizace běží přímo pod Reality Processorem, ne přes samostatný osascript proces.")
+            Text("v0.11: automatizace hledá Reality Processor v Plug-in Extras pod File i Library.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -324,36 +324,31 @@ return {
                 end if
 
                 tell lrProcess
-                    try
-                        set libraryMenu to menu 1 of menu bar item "Library" of menu bar 1
-                    on error
-                        error "Menu Library nebylo nalezeno."
-                    end try
+                    set targetName to "Reality Processor: Načíst HDR frontu"
+                    set topMenus to {"File", "Library"}
 
-                    try
-                        set pluginExtrasItem to menu item "Plug-in Extras" of libraryMenu
-                    on error
-                        error "Library → Plug-in Extras nebylo nalezeno."
-                    end try
-
-                    try
-                        set pluginExtrasMenu to menu 1 of pluginExtrasItem
-                    on error
-                        error "Podmenu Plug-in Extras se nepodařilo otevřít."
-                    end try
-
-                    repeat with pluginItem in menu items of pluginExtrasMenu
+                    repeat with topMenuName in topMenus
                         try
-                            if (name of pluginItem as text) is "Reality Processor: Načíst HDR frontu" then
-                                click pluginItem
-                                return "OK"
-                            end if
+                            set topMenu to menu 1 of menu bar item (topMenuName as text) of menu bar 1
+                            set pluginExtrasItem to menu item "Plug-in Extras" of topMenu
+                            click pluginExtrasItem
+                            delay 0.2
+                            set pluginExtrasMenu to menu 1 of pluginExtrasItem
+
+                            repeat with pluginItem in menu items of pluginExtrasMenu
+                                try
+                                    if (name of pluginItem as text) is targetName then
+                                        click pluginItem
+                                        return "OK"
+                                    end if
+                                end try
+                            end repeat
                         end try
                     end repeat
                 end tell
             end tell
 
-            error "Reality Processor: Načíst HDR frontu nebylo v Library → Plug-in Extras nalezeno."
+            error "Reality Processor: Načíst HDR frontu nebylo nalezeno v Plug-in Extras pod File ani Library."
             """#
 
             guard let appleScript = NSAppleScript(source: scriptSource) else {
@@ -369,9 +364,7 @@ return {
                     ?? "Automatizace Lightroomu selhala."
                 let number = scriptError[NSAppleScript.errorNumber] as? Int
                 let suffix = number.map { " (\($0))" } ?? ""
-                completion(.failure(
-                    message + suffix + "\n\nPokud se zobrazí dotaz, povol Reality Processor také v Nastavení systému → Soukromí a zabezpečení → Automatizace pro System Events a Adobe Lightroom Classic."
-                ))
+                completion(.failure(message + suffix))
                 return
             }
 
