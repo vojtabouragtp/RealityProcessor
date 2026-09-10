@@ -11,6 +11,7 @@ final class PhotoScanner {
     private let droneEVs: [Double] = [-1, 0, 1]
     private let evTolerance = 0.35
     private let maxGroupSpan: TimeInterval = 12.0
+    private let maxDroneFilenameSpan: TimeInterval = 2.0
 
     func scan(folder: URL, mode: BracketMode) async throws -> ScanResult {
         let urls = try discoverFiles(in: folder)
@@ -91,14 +92,18 @@ final class PhotoScanner {
     }
 
     // DJI typicky používá např. DJI_20260909115803_0089_D.DNG.
-    // Tohle je spolehlivější než datum souboru po zkopírování z karty.
+    // Čas přímo v názvu je pro dron spolehlivější než datum souboru po kopírování.
     private func filenameDate(_ url: URL) -> Date? {
-        let name = url.deletingPathExtension().lastPathComponent
+        djiFilenameDate(url.lastPathComponent)
+    }
+
+    private func djiFilenameDate(_ filename: String) -> Date? {
         guard let regex = try? NSRegularExpression(pattern: #"DJI_(\d{14})_"#) else { return nil }
-        let range = NSRange(name.startIndex..<name.endIndex, in: name)
-        guard let match = regex.firstMatch(in: name, range: range),
-              let swiftRange = Range(match.range(at: 1), in: name) else { return nil }
-        let stamp = String(name[swiftRange])
+        let range = NSRange(filename.startIndex..<filename.endIndex, in: filename)
+        guard let match = regex.firstMatch(in: filename, range: range),
+              let swiftRange = Range(match.range(at: 1), in: filename) else { return nil }
+
+        let stamp = String(filename[swiftRange])
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMddHHmmss"
@@ -136,8 +141,7 @@ final class PhotoScanner {
             return detectStandardBrackets(in: photos, targetEVs: cameraEVs, presetName: "Foťák · 5")
 
         case .automatic:
-            // Auto musí fungovat i ve smíšené složce. Dříve se DJI logika použila jen tehdy,
-            // když byly VŠECHNY fotky DNG, takže ve složce ARW + DJI DNG skončily dronovky mimo série.
+            // Auto zpracuje DNG a ostatní RAWy odděleně, takže funguje i smíšená složka.
             let dngPhotos = photos.filter(\.isDNG)
             let nonDNGPhotos = photos.filter { !$0.isDNG }
 
@@ -215,21 +219,31 @@ final class PhotoScanner {
         while index + 2 < dngPhotos.count {
             let candidate = Array(dngPhotos[index..<(index + 3)])
             let numbers = candidate.compactMap { djiSequenceNumber($0.filename) }
+            let filenameDates = candidate.compactMap { djiFilenameDate($0.filename) }
 
             let isSequential: Bool
             if numbers.count == 3 {
                 isSequential = numbers[1] == numbers[0] + 1 && numbers[2] == numbers[1] + 1
             } else {
-                // Když DJI číslo z názvu nejde přečíst, dovolíme trojici DNG za sebou.
-                isSequential = true
+                isSequential = false
             }
 
-            // U názvů jako DJI_20260909120021_0113_D.DNG jsou první tři snímky jedna série,
-            // další trojice začíná novým časovým razítkem. Sekvenční číslo je proto hlavní fallback.
-            if isSequential {
+            // DJI HDR trojice mají v názvu prakticky stejné časové razítko.
+            // Např. 12:00:21 / 12:00:21 / 12:00:21 nebo 12:01:01 / 12:01:01 / 12:01:02.
+            // Tím bezpečně oddělíme jednu HDR trojici od další i při souvislém číslování souborů.
+            let isSameBurst: Bool
+            if filenameDates.count == 3,
+               let first = filenameDates.min(),
+               let last = filenameDates.max() {
+                isSameBurst = last.timeIntervalSince(first) <= maxDroneFilenameSpan
+            } else {
+                isSameBurst = false
+            }
+
+            if isSequential && isSameBurst {
                 groups.append(BracketGroup(
                     photos: candidate,
-                    confidence: numbers.count == 3 ? 1.0 : 0.90,
+                    confidence: 1.0,
                     presetName: "Dron · 3"
                 ))
                 candidate.forEach { used.insert($0.id) }
