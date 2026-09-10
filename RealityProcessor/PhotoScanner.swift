@@ -128,43 +128,59 @@ final class PhotoScanner {
     }
 
     private func detectBrackets(in photos: [PhotoFile], mode: BracketMode) -> ScanResult {
-        // U DJI DNG je spolehlivější pořadí souborů než EV metadata.
-        // V režimu Dron · 3 proto seskupujeme přímo po třech navazujících DJI DNG.
-        if mode == .drone3 {
+        switch mode {
+        case .drone3:
             return detectDroneBrackets(in: photos)
-        }
 
-        // Auto: pokud jsou všechny nalezené snímky DNG, použij stejnou robustní DJI logiku.
-        if mode == .automatic, !photos.isEmpty, photos.allSatisfy(\.isDNG) {
-            return detectDroneBrackets(in: photos)
-        }
+        case .camera5:
+            return detectStandardBrackets(in: photos, targetEVs: cameraEVs, presetName: "Foťák · 5")
 
+        case .automatic:
+            // Auto musí fungovat i ve smíšené složce. Dříve se DJI logika použila jen tehdy,
+            // když byly VŠECHNY fotky DNG, takže ve složce ARW + DJI DNG skončily dronovky mimo série.
+            let dngPhotos = photos.filter(\.isDNG)
+            let nonDNGPhotos = photos.filter { !$0.isDNG }
+
+            let droneResult = detectDroneBrackets(in: dngPhotos)
+            let cameraResult = detectStandardBrackets(
+                in: nonDNGPhotos,
+                targetEVs: cameraEVs,
+                presetName: "Foťák · 5"
+            )
+
+            let groups = (cameraResult.brackets + droneResult.brackets).sorted { lhs, rhs in
+                let l = lhs.photos.first?.captureDate ?? .distantPast
+                let r = rhs.photos.first?.captureDate ?? .distantPast
+                if l != r { return l < r }
+                return (lhs.photos.first?.filename ?? "") < (rhs.photos.first?.filename ?? "")
+            }
+
+            let used = Set(groups.flatMap(\.photos).map(\.id))
+            let ungrouped = photos.filter { !used.contains($0.id) }
+            return ScanResult(allPhotos: photos, brackets: groups, ungrouped: ungrouped)
+        }
+    }
+
+    private func detectStandardBrackets(
+        in photos: [PhotoFile],
+        targetEVs: [Double],
+        presetName: String
+    ) -> ScanResult {
+        let ordered = photos.sorted(by: sortPhotos)
         var groups: [BracketGroup] = []
         var used = Set<UUID>()
         var index = 0
+        let count = targetEVs.count
 
-        while index < photos.count {
-            let preset = presetFor(photo: photos[index], mode: mode)
-            let count = preset.targetEVs.count
+        while index + count <= ordered.count {
+            let candidate = Array(ordered[index..<(index + count)])
+            let score = bracketScore(candidate, targetEVs: targetEVs)
 
-            guard index + count <= photos.count else { break }
-            let candidate = Array(photos[index..<(index + count)])
-
-            if mode == .automatic {
-                let allDNG = candidate.allSatisfy(\.isDNG)
-                let allNonDNG = candidate.allSatisfy { !$0.isDNG }
-                if !allDNG && !allNonDNG {
-                    index += 1
-                    continue
-                }
-            }
-
-            let score = bracketScore(candidate, targetEVs: preset.targetEVs)
             if score >= 0.78 {
                 groups.append(BracketGroup(
                     photos: candidate,
                     confidence: score,
-                    presetName: preset.name
+                    presetName: presetName
                 ))
                 candidate.forEach { used.insert($0.id) }
                 index += count
@@ -173,8 +189,8 @@ final class PhotoScanner {
             }
         }
 
-        let ungrouped = photos.filter { !used.contains($0.id) }
-        return ScanResult(allPhotos: photos, brackets: groups, ungrouped: ungrouped)
+        let ungrouped = ordered.filter { !used.contains($0.id) }
+        return ScanResult(allPhotos: ordered, brackets: groups, ungrouped: ungrouped)
     }
 
     private func detectDroneBrackets(in photos: [PhotoFile]) -> ScanResult {
@@ -204,10 +220,12 @@ final class PhotoScanner {
             if numbers.count == 3 {
                 isSequential = numbers[1] == numbers[0] + 1 && numbers[2] == numbers[1] + 1
             } else {
-                // Když DJI číslo z názvu nejde přečíst, pořád dovolíme trojici DNG za sebou.
+                // Když DJI číslo z názvu nejde přečíst, dovolíme trojici DNG za sebou.
                 isSequential = true
             }
 
+            // U názvů jako DJI_20260909120021_0113_D.DNG jsou první tři snímky jedna série,
+            // další trojice začíná novým časovým razítkem. Sekvenční číslo je proto hlavní fallback.
             if isSequential {
                 groups.append(BracketGroup(
                     photos: candidate,
@@ -223,21 +241,6 @@ final class PhotoScanner {
 
         let ungrouped = photos.filter { !used.contains($0.id) }
         return ScanResult(allPhotos: photos, brackets: groups, ungrouped: ungrouped)
-    }
-
-    private func presetFor(photo: PhotoFile, mode: BracketMode) -> (name: String, targetEVs: [Double]) {
-        switch mode {
-        case .automatic:
-            if photo.isDNG {
-                return ("Dron · 3", droneEVs)
-            } else {
-                return ("Foťák · 5", cameraEVs)
-            }
-        case .camera5:
-            return ("Foťák · 5", cameraEVs)
-        case .drone3:
-            return ("Dron · 3", droneEVs)
-        }
     }
 
     private func bracketScore(_ photos: [PhotoFile], targetEVs: [Double]) -> Double {
