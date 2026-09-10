@@ -122,9 +122,6 @@ local function appleBool(value)
 end
 
 local function runHDRMerge(settings)
-    -- Lightroomův HDR dialog nemá na všech verzích stejné Accessibility názvy.
-    -- Tato verze proto nepředpokládá, že checkbox má name="Auto Align".
-    -- Nejdřív zkouší názvy/description a pak bezpečný fallback podle pořadí checkboxů.
     local scriptPath = '/tmp/realityprocessor_hdr_merge.applescript'
     local logPath = '/tmp/realityprocessor_hdr_osascript.log'
 
@@ -134,42 +131,6 @@ set desiredAutoSettings to ]] .. appleBool(settings.autoSettings) .. [[
 set desiredDeghost to "]] .. tostring(settings.deghost or 'None') .. [["
 set desiredOverlay to ]] .. appleBool(settings.showDeghostOverlay) .. [[
 set desiredStack to ]] .. appleBool(settings.createStack) .. [[
-
-on safeName(theItem)
-    try
-        set n to name of theItem
-        if n is missing value then return ""
-        return n as text
-    on error
-        return ""
-    end try
-end safeName
-
-on safeDescription(theItem)
-    try
-        set d to description of theItem
-        if d is missing value then return ""
-        return d as text
-    on error
-        return ""
-    end try
-end safeDescription
-
-on setCheckboxState(theItem, wanted)
-    tell application "System Events"
-        try
-            set currentValue to value of theItem as integer
-            if wanted and currentValue is 0 then perform action "AXPress" of theItem
-            if (not wanted) and currentValue is 1 then perform action "AXPress" of theItem
-        on error
-            try
-                set currentValue to value of theItem as integer
-                if wanted and currentValue is 0 then click theItem
-                if (not wanted) and currentValue is 1 then click theItem
-            end try
-        end try
-    end tell
-end setCheckboxState
 
 tell application "Adobe Lightroom Classic" to activate
 delay 0.7
@@ -183,20 +144,21 @@ tell application "System Events"
     end tell
 end tell
 
--- Čekáme na dialog podle struktury, ne podle jediného AX názvu.
 set dialogReady to false
 repeat 160 times
     try
         tell application "System Events"
             tell process "Adobe Lightroom Classic"
                 if (count of windows) > 0 then
-                    set allItems to entire contents of front window
+                    set theWindow to front window
+                    set allItems to entire contents of theWindow
                     set checkboxCount to 0
                     set buttonCount to 0
                     repeat with uiItem in allItems
                         try
-                            if role of uiItem is "AXCheckBox" then set checkboxCount to checkboxCount + 1
-                            if role of uiItem is "AXButton" then set buttonCount to buttonCount + 1
+                            set itemRole to role of uiItem as text
+                            if itemRole is "AXCheckBox" then set checkboxCount to checkboxCount + 1
+                            if itemRole is "AXButton" then set buttonCount to buttonCount + 1
                         end try
                     end repeat
                     if checkboxCount >= 4 and buttonCount >= 4 then set dialogReady to true
@@ -208,156 +170,128 @@ repeat 160 times
     delay 0.25
 end repeat
 
-if dialogReady is false then error "HDR dialog not found: expected at least 4 checkboxes and 4 buttons"
+if dialogReady is false then error "HDR dialog not found"
 
 tell application "System Events"
     tell process "Adobe Lightroom Classic"
-        set allItems to entire contents of front window
+        set theWindow to front window
+        set allItems to entire contents of theWindow
         set allCheckboxes to {}
 
         repeat with uiItem in allItems
             try
-                if role of uiItem is "AXCheckBox" then set end of allCheckboxes to uiItem
+                if (role of uiItem as text) is "AXCheckBox" then
+                    set end of allCheckboxes to uiItem
+                end if
             end try
         end repeat
 
-        -- 1) Preferujeme skutečné Accessibility názvy/description, pokud existují.
-        set foundAlign to false
-        set foundAuto to false
-        set foundOverlay to false
-        set foundStack to false
-
-        repeat with cb in allCheckboxes
-            set labelText to my safeName(cb) & " " & my safeDescription(cb)
-            ignoring case
-                if labelText contains "auto align" then
-                    my setCheckboxState(cb, desiredAutoAlign)
-                    set foundAlign to true
-                else if labelText contains "auto settings" then
-                    my setCheckboxState(cb, desiredAutoSettings)
-                    set foundAuto to true
-                else if labelText contains "deghost overlay" then
-                    my setCheckboxState(cb, desiredOverlay)
-                    set foundOverlay to true
-                else if labelText contains "create stack" then
-                    my setCheckboxState(cb, desiredStack)
-                    set foundStack to true
-                end if
-            end ignoring
-        end repeat
-
-        -- 2) Fallback pro Lightroom buildy, kde checkboxy nemají názvy.
-        -- V HDR dialogu jsou v pořadí: Auto Align, Auto Settings, Show Deghost Overlay, Create Stack.
+        -- Checkbox fallback by order: Auto Align, Auto Settings, Show Deghost Overlay, Create Stack
         if (count of allCheckboxes) >= 4 then
-            if not foundAlign then my setCheckboxState(item 1 of allCheckboxes, desiredAutoAlign)
-            if not foundAuto then my setCheckboxState(item 2 of allCheckboxes, desiredAutoSettings)
-            if not foundOverlay then my setCheckboxState(item 3 of allCheckboxes, desiredOverlay)
-            if not foundStack then my setCheckboxState(item 4 of allCheckboxes, desiredStack)
+            set cb1 to item 1 of allCheckboxes
+            set cb2 to item 2 of allCheckboxes
+            set cb3 to item 3 of allCheckboxes
+            set cb4 to item 4 of allCheckboxes
+
+            try
+                set v1 to value of cb1 as integer
+                if desiredAutoAlign and v1 is 0 then click cb1
+                if (not desiredAutoAlign) and v1 is 1 then click cb1
+            end try
+            try
+                set v2 to value of cb2 as integer
+                if desiredAutoSettings and v2 is 0 then click cb2
+                if (not desiredAutoSettings) and v2 is 1 then click cb2
+            end try
+            try
+                set v3 to value of cb3 as integer
+                if desiredOverlay and v3 is 0 then click cb3
+                if (not desiredOverlay) and v3 is 1 then click cb3
+            end try
+            try
+                set v4 to value of cb4 as integer
+                if desiredStack and v4 is 0 then click cb4
+                if (not desiredStack) and v4 is 1 then click cb4
+            end try
         end if
 
-        delay 0.25
+        delay 0.3
 
-        -- Deghost: nejdřív podle názvu. Když AX jméno chybí, použijeme pořadí
-        -- čtyř velkých tlačítek None/Low/Medium/High v dialogu.
-        set deghostClicked to false
-        set namedDeghostButtons to {}
-        repeat with uiItem in (entire contents of front window)
+        -- Deghost buttons: try by AX title/name first.
+        set deghostDone to false
+        set allItems to entire contents of theWindow
+        repeat with uiItem in allItems
             try
-                if role of uiItem is "AXButton" or role of uiItem is "AXRadioButton" then
-                    set n to my safeName(uiItem)
-                    if n is "None" or n is "Low" or n is "Medium" or n is "High" then
-                        set end of namedDeghostButtons to uiItem
-                        if n is desiredDeghost then
-                            try
-                                perform action "AXPress" of uiItem
-                            on error
-                                click uiItem
-                            end try
-                            set deghostClicked to true
-                        end if
+                set itemRole to role of uiItem as text
+                if itemRole is "AXButton" or itemRole is "AXRadioButton" then
+                    set itemName to ""
+                    try
+                        set itemName to name of uiItem as text
+                    end try
+                    if itemName is desiredDeghost then
+                        click uiItem
+                        set deghostDone to true
+                        exit repeat
                     end if
                 end if
             end try
         end repeat
 
-        -- Pokud se názvy nepodařilo použít, hledáme čtyři nejširší běžná tlačítka
-        -- a z nich vybereme dle indexu. Je to fallback, ne primární cesta.
-        if not deghostClicked then
+        -- Fallback: four wide buttons in visual order.
+        if deghostDone is false then
             set wideButtons to {}
-            repeat with uiItem in (entire contents of front window)
+            set allItems to entire contents of theWindow
+            repeat with uiItem in allItems
                 try
-                    if role of uiItem is "AXButton" then
+                    if (role of uiItem as text) is "AXButton" then
                         set s to size of uiItem
-                        if item 1 of s > 250 then set end of wideButtons to uiItem
+                        if (item 1 of s) > 250 then
+                            set end of wideButtons to uiItem
+                        end if
                     end if
                 end try
             end repeat
+
             if (count of wideButtons) >= 4 then
                 set wantedIndex to 1
                 if desiredDeghost is "Low" then set wantedIndex to 2
                 if desiredDeghost is "Medium" then set wantedIndex to 3
                 if desiredDeghost is "High" then set wantedIndex to 4
-                try
-                    perform action "AXPress" of item wantedIndex of wideButtons
-                    set deghostClicked to true
-                on error
-                    try
-                        click item wantedIndex of wideButtons
-                        set deghostClicked to true
-                    end try
-                end try
+                click item wantedIndex of wideButtons
+                set deghostDone to true
             end if
         end if
 
-        delay 0.35
+        delay 0.5
 
-        -- Overlay znovu po změně deghostu, protože Lightroom ho může enable/disable.
-        set refreshedCheckboxes to {}
-        repeat with uiItem in (entire contents of front window)
-            try
-                if role of uiItem is "AXCheckBox" then set end of refreshedCheckboxes to uiItem
-            end try
-        end repeat
-        if (count of refreshedCheckboxes) >= 3 then
-            set overlayBox to item 3 of refreshedCheckboxes
-            try
-                if enabled of overlayBox then my setCheckboxState(overlayBox, desiredOverlay)
-            end try
-        end if
-
-        -- Najít Merge. Preferujeme AX name, potom default-button atribut, nakonec Enter.
-        set merged to false
+        -- Wait for Merge button; otherwise use Return as final fallback.
+        set mergeDone to false
         repeat 320 times
-            set currentItems to entire contents of front window
-            repeat with uiItem in currentItems
+            set allItems to entire contents of theWindow
+            repeat with uiItem in allItems
                 try
-                    if role of uiItem is "AXButton" then
-                        set n to my safeName(uiItem)
-                        ignoring case
-                            if n is "Merge" or n contains "merge" then
-                                if enabled of uiItem then
-                                    try
-                                        perform action "AXPress" of uiItem
-                                    on error
-                                        click uiItem
-                                    end try
-                                    set merged to true
-                                    exit repeat
-                                end if
+                    if (role of uiItem as text) is "AXButton" then
+                        set itemName to ""
+                        try
+                            set itemName to name of uiItem as text
+                        end try
+                        if itemName is "Merge" then
+                            if enabled of uiItem then
+                                click uiItem
+                                set mergeDone to true
+                                exit repeat
                             end if
-                        end ignoring
+                        end if
                     end if
                 end try
             end repeat
-            if merged then exit repeat
+            if mergeDone then exit repeat
             delay 0.25
         end repeat
 
-        if merged is false then
-            -- Ve standardním HDR dialogu je Merge výchozí akce. Return je poslední fallback.
+        if mergeDone is false then
             key code 36
             delay 0.5
-            set merged to true
         end if
     end tell
 end tell
@@ -502,14 +436,12 @@ local function processQueue(showDialog)
             local status = runHDRMerge(settings)
             if status ~= 0 then
                 local logText = ''
-                local logHandle = io.open('/tmp/realityprocessor_hdr_osascript.log', 'r')
-                if logHandle then
-                    logText = logHandle:read('*a') or ''
-                    logHandle:close()
+                local h = io.open('/tmp/realityprocessor_hdr_osascript.log', 'r')
+                if h then
+                    logText = h:read('*a') or ''
+                    h:close()
                 end
-                logText = string.gsub(logText, '[\r\n]+', ' ')
-                if string.len(logText) > 400 then logText = string.sub(logText, 1, 400) end
-
+                logText = logText:gsub('[\r\n]+', ' ')
                 local message = 'HDR dialog automatizace selhala (osascript exit ' .. tostring(status) .. ')'
                 if logText ~= '' then message = message .. ': ' .. logText end
                 writeAck('ERROR: ' .. message)
