@@ -84,35 +84,35 @@ local function processQueue(showDialog)
         return false
     end
 
-    local catalog = LrApplication.activeCatalog()
-    local importedCount = 0
-    local missingPaths = {}
+    writeHeartbeat('processing')
 
-    -- Nejprve sesbíráme jen fotky, které ještě v katalogu nejsou.
-    -- Import pak proběhne v jednom write-access bloku místo desítek samostatných importů.
+    local catalog = LrApplication.activeCatalog()
+    local missingPaths = {}
+    local seenMissing = {}
+
+    -- Sesbírat jen unikátní RAWy, které ještě nejsou v katalogu.
     for _, group in ipairs(manifest.groups) do
-        group.photos = {}
         for _, photoPath in ipairs(group.paths or {}) do
-            local photo = catalog:findPhotoByPath(photoPath)
-            if photo then
-                table.insert(group.photos, photo)
-                importedCount = importedCount + 1
-            else
+            if not catalog:findPhotoByPath(photoPath) and not seenMissing[photoPath] then
+                seenMissing[photoPath] = true
                 table.insert(missingPaths, photoPath)
             end
         end
     end
 
+    -- Jeden write-access blok pro celý import. Trigger už je v této chvíli smazaný,
+    -- takže stejnou frontu watcher nemůže spustit znovu během importu.
     if #missingPaths > 0 then
         catalog:withWriteAccessDo('Reality Processor import', function()
             for _, photoPath in ipairs(missingPaths) do
-                catalog:addPhoto(photoPath)
+                if not catalog:findPhotoByPath(photoPath) then
+                    catalog:addPhoto(photoPath)
+                end
             end
         end)
     end
 
-    -- Po importu znovu sestavíme skupiny z objektů LrPhoto.
-    importedCount = 0
+    local importedCount = 0
     for _, group in ipairs(manifest.groups) do
         group.photos = {}
         for _, photoPath in ipairs(group.paths or {}) do
@@ -148,30 +148,50 @@ local function processQueue(showDialog)
     return true
 end
 
+local function consumeTrigger()
+    local trigger = triggerPath()
+    if not LrFileUtils.exists(trigger) then
+        return false
+    end
+
+    -- Trigger musí zmizet PŘED spuštěním importu. Když smazání selže,
+    -- frontu vůbec nespouštíme, jinak by se opakovala každou sekundu.
+    local ok, err = LrTasks.pcall(function()
+        LrFileUtils.delete(trigger)
+    end)
+
+    if not ok or LrFileUtils.exists(trigger) then
+        writeHeartbeat('trigger-delete-error:' .. tostring(err))
+        writeAck('ERROR: nepodařilo se odstranit HDR trigger')
+        return false
+    end
+
+    return true
+end
+
 if not _G.RealityProcessorBridgeStarted then
     _G.RealityProcessorBridgeStarted = true
+    _G.RealityProcessorQueueBusy = false
 
     LrTasks.startAsyncTask(function()
         writeHeartbeat('started')
 
         while true do
-            writeHeartbeat('alive')
-            local trigger = triggerPath()
+            if not _G.RealityProcessorQueueBusy then
+                writeHeartbeat('alive')
 
-            if LrFileUtils.exists(trigger) then
-                pcall(function()
-                    LrFileUtils.delete(trigger)
-                end)
+                if consumeTrigger() then
+                    _G.RealityProcessorQueueBusy = true
 
-                -- Nepoužívat obyčejné Lua pcall kolem processQueue.
-                -- Lightroom katalogové operace mohou yieldovat a přes C pcall hranici to padá
-                -- na "Yielding is not allowed within a C or metamethod call".
-                local ok, result = LrTasks.pcall(processQueue, false)
-                if not ok then
-                    writeHeartbeat('processor-error:' .. tostring(result))
-                    writeAck('ERROR: ' .. tostring(result))
-                elseif result == false then
-                    writeHeartbeat('processor-failed')
+                    local ok, result = LrTasks.pcall(processQueue, false)
+                    if not ok then
+                        writeHeartbeat('processor-error:' .. tostring(result))
+                        writeAck('ERROR: ' .. tostring(result))
+                    elseif result == false then
+                        writeHeartbeat('processor-failed')
+                    end
+
+                    _G.RealityProcessorQueueBusy = false
                 end
             end
 
@@ -180,18 +200,6 @@ if not _G.RealityProcessorBridgeStarted then
     end)
 end
 
-LrTasks.startAsyncTask(function()
-    local trigger = triggerPath()
-    if LrFileUtils.exists(trigger) then
-        pcall(function()
-            LrFileUtils.delete(trigger)
-        end)
-
-        local ok, result = LrTasks.pcall(processQueue, true)
-        if not ok then
-            writeHeartbeat('processor-error:' .. tostring(result))
-            writeAck('ERROR: ' .. tostring(result))
-            LrDialogs.message('Reality Processor', tostring(result), 'critical')
-        end
-    end
-end)
+-- Záměrně tu není druhý jednorázový startAsyncTask.
+-- Předchozí verze měla watcher + jednorázové zpracování současně, takže při startu
+-- pluginu mohly stejný trigger převzít dvě úlohy a import spustit dvakrát.
