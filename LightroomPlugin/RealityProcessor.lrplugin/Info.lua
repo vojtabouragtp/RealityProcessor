@@ -3,10 +3,8 @@ return {
     LrSdkMinimumVersion = 3.0,
     LrToolkitIdentifier = 'com.vojtaboura.realityprocessor',
     LrPluginName = 'Reality Processor',
-    VERSION = { major = 1, minor = 6, revision = 0, build = 0 },
+    VERSION = { major = 1, minor = 7, revision = 0, build = 0 },
 
-    -- Používáme existující LoadHDRQueue.lua i jako init skript.
-    -- Tím se vyhneme problému, kdy Lightroom lokálně neviděl nově přidané Init/PluginInit soubory.
     LrInitPlugin = 'LoadHDRQueue.lua',
     LrForceInitPlugin = true,
 
