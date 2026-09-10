@@ -36,7 +36,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.13")
+                Text("HDR workflow · v0.14")
                     .foregroundStyle(.secondary)
             }
 
@@ -110,7 +110,7 @@ struct ContentView: View {
 
             Spacer()
 
-            Text("v0.13: kontroluje, že Lightroom bridge skutečně převzal HDR frontu.")
+            Text("v0.14: delší čekání na import a diagnostika přesného stavu Lightroom bridge.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -227,7 +227,7 @@ struct ContentView: View {
                         statusMessage = detail
                     case .failure(let message):
                         errorMessage = message
-                        statusMessage = "Lightroom frontu nepřevzal."
+                        statusMessage = "Lightroom frontu nedokončil."
                     }
                 }
             }
@@ -314,7 +314,7 @@ return {
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let deadline = Date().addingTimeInterval(12)
+            let deadline = Date().addingTimeInterval(60)
 
             while Date() < deadline {
                 if let ack = try? String(contentsOf: ackURL, encoding: .utf8) {
@@ -338,9 +338,9 @@ return {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             if let heartbeat, !heartbeat.isEmpty {
-                completion(.failure("Lightroom plugin běží, ale HDR trigger nezpracoval. Stav bridge: \(heartbeat). V Plug-in Manageru ověř verzi 1.3 a dej Disable → Enable."))
+                completion(.failure("Lightroom po 60 s operaci nedokončil. Poslední stav bridge: \(heartbeat). Pošli mi přesně tento stav."))
             } else {
-                completion(.failure("Lightroom bridge se vůbec nespustil. V Plug-in Manageru ověř Reality Processor verzi 1.3 a dej Disable → Enable, případně Remove → Add."))
+                completion(.failure("Lightroom bridge se vůbec nespustil. Zkontroluj Reality Processor v Plug-in Manageru a dej Disable → Enable, případně Remove → Add."))
             }
         }
     }
