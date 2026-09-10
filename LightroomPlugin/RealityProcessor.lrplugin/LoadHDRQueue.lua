@@ -117,191 +117,214 @@ local function selectGroup(catalog, photos)
     return true
 end
 
-local function appleBool(value)
+local function jsBool(value)
     return value and 'true' or 'false'
 end
 
+local function jsString(value)
+    local text = tostring(value or '')
+    text = text:gsub('\\', '\\\\')
+    text = text:gsub('"', '\\"')
+    text = text:gsub('\r', '\\r')
+    text = text:gsub('\n', '\\n')
+    return '"' .. text .. '"'
+end
+
 local function runHDRMerge(settings)
-    local scriptPath = '/tmp/realityprocessor_hdr_merge.applescript'
+    -- AppleScript parser se na různých macOS/Lightroom kombinacích ukázal jako křehký.
+    -- UI automatizaci proto spouštíme přes JXA (JavaScript for Automation).
+    local scriptPath = '/tmp/realityprocessor_hdr_merge.js'
     local logPath = '/tmp/realityprocessor_hdr_osascript.log'
 
     local script = [[
-set desiredAutoAlign to ]] .. appleBool(settings.autoAlign) .. [[
-set desiredAutoSettings to ]] .. appleBool(settings.autoSettings) .. [[
-set desiredDeghost to "]] .. tostring(settings.deghost or 'None') .. [["
-set desiredOverlay to ]] .. appleBool(settings.showDeghostOverlay) .. [[
-set desiredStack to ]] .. appleBool(settings.createStack) .. [[
+var desiredAutoAlign = ]] .. jsBool(settings.autoAlign) .. [[;
+var desiredAutoSettings = ]] .. jsBool(settings.autoSettings) .. [[;
+var desiredDeghost = ]] .. jsString(settings.deghost or 'None') .. [[;
+var desiredOverlay = ]] .. jsBool(settings.showDeghostOverlay) .. [[;
+var desiredStack = ]] .. jsBool(settings.createStack) .. [[;
 
-tell application "Adobe Lightroom Classic" to activate
-delay 0.7
+var lr = Application('Adobe Lightroom Classic');
+var se = Application('System Events');
+lr.activate();
+delay(0.8);
 
-tell application "System Events"
-    tell process "Adobe Lightroom Classic"
-        set frontmost to true
-        key code 5
-        delay 0.6
-        key code 4 using {control down, shift down}
-    end tell
-end tell
+var proc = se.processes.byName('Adobe Lightroom Classic');
+proc.frontmost = true;
+se.keyCode(5); // G = Library Grid
+delay(0.7);
+se.keyCode(4, {using: ['control down', 'shift down']}); // Ctrl+Shift+H
+delay(0.5);
 
-set dialogReady to false
-repeat 160 times
-    try
-        tell application "System Events"
-            tell process "Adobe Lightroom Classic"
-                if (count of windows) > 0 then
-                    set theWindow to front window
-                    set allItems to entire contents of theWindow
-                    set checkboxCount to 0
-                    set buttonCount to 0
-                    repeat with uiItem in allItems
-                        try
-                            set itemRole to role of uiItem as text
-                            if itemRole is "AXCheckBox" then set checkboxCount to checkboxCount + 1
-                            if itemRole is "AXButton" then set buttonCount to buttonCount + 1
-                        end try
-                    end repeat
-                    if checkboxCount >= 4 and buttonCount >= 4 then set dialogReady to true
-                end if
-            end tell
-        end tell
-    end try
-    if dialogReady then exit repeat
-    delay 0.25
-end repeat
+function safe(f, fallback) {
+    try { return f(); } catch (e) { return fallback; }
+}
 
-if dialogReady is false then error "HDR dialog not found"
+function childrenOf(el) {
+    return safe(function () { return el.uiElements(); }, []);
+}
 
-tell application "System Events"
-    tell process "Adobe Lightroom Classic"
-        set theWindow to front window
-        set allItems to entire contents of theWindow
-        set allCheckboxes to {}
+function flatten(root) {
+    var out = [];
+    var queue = [root];
+    var guard = 0;
+    while (queue.length && guard < 4000) {
+        guard++;
+        var el = queue.shift();
+        out.push(el);
+        var kids = childrenOf(el);
+        for (var i = 0; i < kids.length; i++) queue.push(kids[i]);
+    }
+    return out;
+}
 
-        repeat with uiItem in allItems
-            try
-                if (role of uiItem as text) is "AXCheckBox" then
-                    set end of allCheckboxes to uiItem
-                end if
-            end try
-        end repeat
+function roleOf(el) {
+    return safe(function () { return String(el.role()); }, '');
+}
 
-        -- Checkbox fallback by order: Auto Align, Auto Settings, Show Deghost Overlay, Create Stack
-        if (count of allCheckboxes) >= 4 then
-            set cb1 to item 1 of allCheckboxes
-            set cb2 to item 2 of allCheckboxes
-            set cb3 to item 3 of allCheckboxes
-            set cb4 to item 4 of allCheckboxes
+function nameOf(el) {
+    var n = safe(function () { return el.name(); }, '');
+    if (n === null || n === undefined) n = '';
+    return String(n);
+}
 
-            try
-                set v1 to value of cb1 as integer
-                if desiredAutoAlign and v1 is 0 then click cb1
-                if (not desiredAutoAlign) and v1 is 1 then click cb1
-            end try
-            try
-                set v2 to value of cb2 as integer
-                if desiredAutoSettings and v2 is 0 then click cb2
-                if (not desiredAutoSettings) and v2 is 1 then click cb2
-            end try
-            try
-                set v3 to value of cb3 as integer
-                if desiredOverlay and v3 is 0 then click cb3
-                if (not desiredOverlay) and v3 is 1 then click cb3
-            end try
-            try
-                set v4 to value of cb4 as integer
-                if desiredStack and v4 is 0 then click cb4
-                if (not desiredStack) and v4 is 1 then click cb4
-            end try
-        end if
+function descOf(el) {
+    var d = safe(function () { return el.description(); }, '');
+    if (d === null || d === undefined) d = '';
+    return String(d);
+}
 
-        delay 0.3
+function clickEl(el) {
+    try { el.click(); return true; } catch (e) {}
+    try { el.actions.byName('AXPress').perform(); return true; } catch (e) {}
+    return false;
+}
 
-        -- Deghost buttons: try by AX title/name first.
-        set deghostDone to false
-        set allItems to entire contents of theWindow
-        repeat with uiItem in allItems
-            try
-                set itemRole to role of uiItem as text
-                if itemRole is "AXButton" or itemRole is "AXRadioButton" then
-                    set itemName to ""
-                    try
-                        set itemName to name of uiItem as text
-                    end try
-                    if itemName is desiredDeghost then
-                        click uiItem
-                        set deghostDone to true
-                        exit repeat
-                    end if
-                end if
-            end try
-        end repeat
+function checkboxValue(el) {
+    return Number(safe(function () { return el.value(); }, 0));
+}
 
-        -- Fallback: four wide buttons in visual order.
-        if deghostDone is false then
-            set wideButtons to {}
-            set allItems to entire contents of theWindow
-            repeat with uiItem in allItems
-                try
-                    if (role of uiItem as text) is "AXButton" then
-                        set s to size of uiItem
-                        if (item 1 of s) > 250 then
-                            set end of wideButtons to uiItem
-                        end if
-                    end if
-                end try
-            end repeat
+function setCheckbox(el, wanted) {
+    var current = checkboxValue(el);
+    if ((wanted && current === 0) || (!wanted && current !== 0)) clickEl(el);
+}
 
-            if (count of wideButtons) >= 4 then
-                set wantedIndex to 1
-                if desiredDeghost is "Low" then set wantedIndex to 2
-                if desiredDeghost is "Medium" then set wantedIndex to 3
-                if desiredDeghost is "High" then set wantedIndex to 4
-                click item wantedIndex of wideButtons
-                set deghostDone to true
-            end if
-        end if
+function currentWindow() {
+    return safe(function () { return proc.windows[0]; }, null);
+}
 
-        delay 0.5
+var win = null;
+var items = [];
+var checkboxes = [];
+var ready = false;
 
-        -- Wait for Merge button; otherwise use Return as final fallback.
-        set mergeDone to false
-        repeat 320 times
-            set allItems to entire contents of theWindow
-            repeat with uiItem in allItems
-                try
-                    if (role of uiItem as text) is "AXButton" then
-                        set itemName to ""
-                        try
-                            set itemName to name of uiItem as text
-                        end try
-                        if itemName is "Merge" then
-                            if enabled of uiItem then
-                                click uiItem
-                                set mergeDone to true
-                                exit repeat
-                            end if
-                        end if
-                    end if
-                end try
-            end repeat
-            if mergeDone then exit repeat
-            delay 0.25
-        end repeat
+for (var attempt = 0; attempt < 160; attempt++) {
+    win = currentWindow();
+    if (win) {
+        items = flatten(win);
+        checkboxes = items.filter(function (el) { return roleOf(el) === 'AXCheckBox'; });
+        if (checkboxes.length >= 4) {
+            ready = true;
+            break;
+        }
+    }
+    delay(0.25);
+}
 
-        if mergeDone is false then
-            key code 36
-            delay 0.5
-        end if
-    end tell
-end tell
+if (!ready) throw new Error('HDR dialog not found');
+
+// Primárně hledáme checkbox podle accessibility názvu/description.
+var named = {align: null, auto: null, overlay: null, stack: null};
+checkboxes.forEach(function (cb) {
+    var label = (nameOf(cb) + ' ' + descOf(cb)).toLowerCase();
+    if (label.indexOf('auto align') >= 0) named.align = cb;
+    else if (label.indexOf('auto settings') >= 0) named.auto = cb;
+    else if (label.indexOf('deghost overlay') >= 0) named.overlay = cb;
+    else if (label.indexOf('create stack') >= 0) named.stack = cb;
+});
+
+setCheckbox(named.align || checkboxes[0], desiredAutoAlign);
+setCheckbox(named.auto || checkboxes[1], desiredAutoSettings);
+setCheckbox(named.overlay || checkboxes[2], desiredOverlay);
+setCheckbox(named.stack || checkboxes[3], desiredStack);
+delay(0.3);
+
+// Deghost Amount.
+items = flatten(win);
+var deghostButtons = items.filter(function (el) {
+    var r = roleOf(el);
+    var n = nameOf(el);
+    return (r === 'AXButton' || r === 'AXRadioButton') &&
+        (n === 'None' || n === 'Low' || n === 'Medium' || n === 'High');
+});
+
+var deghostTarget = null;
+for (var i = 0; i < deghostButtons.length; i++) {
+    if (nameOf(deghostButtons[i]) === desiredDeghost) {
+        deghostTarget = deghostButtons[i];
+        break;
+    }
+}
+
+if (deghostTarget) {
+    clickEl(deghostTarget);
+} else {
+    // Fallback: široká tlačítka None/Low/Medium/High podle svislé pozice.
+    var wide = items.filter(function (el) {
+        if (roleOf(el) !== 'AXButton') return false;
+        var size = safe(function () { return el.size(); }, [0, 0]);
+        return Number(size[0]) > 250;
+    });
+    wide.sort(function (a, b) {
+        var pa = safe(function () { return a.position(); }, [0, 0]);
+        var pb = safe(function () { return b.position(); }, [0, 0]);
+        return Number(pa[1]) - Number(pb[1]);
+    });
+    if (wide.length >= 4) {
+        var idx = {None: 0, Low: 1, Medium: 2, High: 3}[desiredDeghost];
+        if (idx === undefined) idx = 0;
+        clickEl(wide[idx]);
+    }
+}
+delay(0.4);
+
+// Overlay znovu po změně deghostu.
+items = flatten(win);
+checkboxes = items.filter(function (el) { return roleOf(el) === 'AXCheckBox'; });
+if (checkboxes.length >= 3) setCheckbox(checkboxes[2], desiredOverlay);
+
+// Počkat, až Lightroom dopočítá preview a Merge bude aktivní.
+var merged = false;
+for (var wait = 0; wait < 320 && !merged; wait++) {
+    items = flatten(win);
+    var buttons = items.filter(function (el) { return roleOf(el) === 'AXButton'; });
+    for (var b = 0; b < buttons.length; b++) {
+        var n = nameOf(buttons[b]).toLowerCase();
+        if (n === 'merge' || n.indexOf('merge') >= 0) {
+            var enabled = safe(function () { return !!buttons[b].enabled(); }, true);
+            if (enabled && clickEl(buttons[b])) {
+                merged = true;
+                break;
+            }
+        }
+    }
+    if (!merged) delay(0.25);
+}
+
+if (!merged) {
+    // Standardní dialog má Merge jako default action.
+    se.keyCode(36);
+    delay(0.6);
+    merged = true;
+}
+
+'OK';
 ]]
 
     if not writeFile(scriptPath, script) then
         return 90
     end
 
-    local command = '/usr/bin/osascript ' .. scriptPath .. ' >' .. logPath .. ' 2>&1'
+    local command = '/usr/bin/osascript -l JavaScript ' .. scriptPath .. ' >' .. logPath .. ' 2>&1'
     return LrTasks.execute(command)
 end
 
