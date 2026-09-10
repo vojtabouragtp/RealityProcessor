@@ -35,6 +35,10 @@ local function heartbeatPath()
     return LrPathUtils.child(supportFolder(), 'lightroom_bridge.heartbeat')
 end
 
+local function hdrSettingsPath()
+    return LrPathUtils.child(supportFolder(), 'hdr_settings.lua')
+end
+
 local function writeFile(path, text)
     local handle = io.open(path, 'w')
     if handle then
@@ -53,12 +57,41 @@ local function writeAck(text)
     writeFile(ackPath(), text or 'OK')
 end
 
-local function loadManifest(path)
+local function loadLuaTable(path)
     local chunk, err = loadfile(path)
     if not chunk then return nil, err end
-    local ok, manifest = pcall(chunk)
-    if not ok then return nil, manifest end
-    return manifest, nil
+    local ok, value = pcall(chunk)
+    if not ok then return nil, value end
+    return value, nil
+end
+
+local function loadManifest(path)
+    return loadLuaTable(path)
+end
+
+local function loadHDRSettings()
+    local defaults = {
+        autoAlign = true,
+        autoSettings = false,
+        deghost = 'None',
+        showDeghostOverlay = false,
+        createStack = true,
+    }
+
+    if not LrFileUtils.exists(hdrSettingsPath()) then
+        return defaults
+    end
+
+    local settings = loadLuaTable(hdrSettingsPath())
+    if not settings then return defaults end
+
+    if settings.autoAlign ~= nil then defaults.autoAlign = settings.autoAlign end
+    if settings.autoSettings ~= nil then defaults.autoSettings = settings.autoSettings end
+    if settings.deghost ~= nil then defaults.deghost = settings.deghost end
+    if settings.showDeghostOverlay ~= nil then defaults.showDeghostOverlay = settings.showDeghostOverlay end
+    if settings.createStack ~= nil then defaults.createStack = settings.createStack end
+
+    return defaults
 end
 
 local function uniquePhotosFromGroups(groups)
@@ -84,22 +117,150 @@ local function selectGroup(catalog, photos)
     return true
 end
 
-local function runHeadlessHDRMerge()
-    -- Lightroom Classic macOS: Control+Shift+H = headless HDR merge.
-    -- Nejdřív přepneme na Library Grid (G), počkáme na UI a pak pošleme zkratku.
-    -- Používáme key code, aby to nebylo závislé na rozložení klávesnice.
-    local command = [[/usr/bin/osascript \
--e 'tell application "Adobe Lightroom Classic" to activate' \
--e 'delay 0.8' \
--e 'tell application "System Events"' \
--e '  tell process "Adobe Lightroom Classic"' \
--e '    set frontmost to true' \
--e '    key code 5' \
--e '    delay 0.8' \
--e '    key code 4 using {control down, shift down}' \
--e '  end tell' \
--e 'end tell' \
->/tmp/realityprocessor_hdr_osascript.log 2>&1]]
+local function appleBool(value)
+    return value and 'true' or 'false'
+end
+
+local function runHDRMerge(settings)
+    -- Otevře standardní HDR dialog, převezme nastavení z RealityProcessoru
+    -- a nakonec automaticky stiskne Merge.
+    local scriptPath = '/tmp/realityprocessor_hdr_merge.applescript'
+    local logPath = '/tmp/realityprocessor_hdr_osascript.log'
+
+    local script = [[
+set desiredAutoAlign to ]] .. appleBool(settings.autoAlign) .. [[
+set desiredAutoSettings to ]] .. appleBool(settings.autoSettings) .. [[
+set desiredDeghost to "]] .. tostring(settings.deghost or 'None') .. [["
+set desiredOverlay to ]] .. appleBool(settings.showDeghostOverlay) .. [[
+set desiredStack to ]] .. appleBool(settings.createStack) .. [[
+
+tell application "Adobe Lightroom Classic" to activate
+delay 0.8
+
+tell application "System Events"
+    tell process "Adobe Lightroom Classic"
+        set frontmost to true
+        -- Library Grid, potom běžný HDR dialog.
+        key code 5
+        delay 0.7
+        key code 4 using {control down, shift down}
+    end tell
+end tell
+
+-- Počkat, až se HDR dialog opravdu vykreslí.
+set dialogReady to false
+repeat 120 times
+    try
+        tell application "System Events"
+            tell process "Adobe Lightroom Classic"
+                repeat with uiItem in (entire contents of front window)
+                    try
+                        if (role of uiItem is "AXCheckBox") and (name of uiItem is "Auto Align") then
+                            set dialogReady to true
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+            end tell
+        end tell
+    end try
+    if dialogReady then exit repeat
+    delay 0.25
+end repeat
+
+if dialogReady is false then error "HDR dialog not found"
+
+tell application "System Events"
+    tell process "Adobe Lightroom Classic"
+        set allItems to entire contents of front window
+
+        -- Checkboxes podle jejich Accessibility názvů.
+        repeat with uiItem in allItems
+            try
+                if (role of uiItem is "AXCheckBox") then
+                    set itemName to name of uiItem
+                    if itemName is "Auto Align" then
+                        set currentValue to (value of uiItem as integer)
+                        if desiredAutoAlign and currentValue is 0 then click uiItem
+                        if (not desiredAutoAlign) and currentValue is 1 then click uiItem
+                    else if itemName is "Auto Settings" then
+                        set currentValue to (value of uiItem as integer)
+                        if desiredAutoSettings and currentValue is 0 then click uiItem
+                        if (not desiredAutoSettings) and currentValue is 1 then click uiItem
+                    else if itemName is "Show Deghost Overlay" then
+                        set currentValue to (value of uiItem as integer)
+                        if desiredOverlay and currentValue is 0 then click uiItem
+                        if (not desiredOverlay) and currentValue is 1 then click uiItem
+                    else if itemName is "Create Stack" then
+                        set currentValue to (value of uiItem as integer)
+                        if desiredStack and currentValue is 0 then click uiItem
+                        if (not desiredStack) and currentValue is 1 then click uiItem
+                    end if
+                end if
+            end try
+        end repeat
+
+        delay 0.2
+
+        -- Deghost Amount: Lightroom ho vystavuje jako jeden z prvků None/Low/Medium/High.
+        set deghostClicked to false
+        repeat with uiItem in (entire contents of front window)
+            try
+                if (name of uiItem is desiredDeghost) then
+                    set itemRole to role of uiItem
+                    if itemRole is "AXButton" or itemRole is "AXRadioButton" then
+                        click uiItem
+                        set deghostClicked to true
+                        exit repeat
+                    end if
+                end if
+            end try
+        end repeat
+
+        delay 0.25
+
+        -- Po změně Deghostu znovu srovnat Overlay, protože Lightroom ho může enable/disable.
+        repeat with uiItem in (entire contents of front window)
+            try
+                if (role of uiItem is "AXCheckBox") and (name of uiItem is "Show Deghost Overlay") then
+                    if enabled of uiItem then
+                        set currentValue to (value of uiItem as integer)
+                        if desiredOverlay and currentValue is 0 then click uiItem
+                        if (not desiredOverlay) and currentValue is 1 then click uiItem
+                    end if
+                    exit repeat
+                end if
+            end try
+        end repeat
+
+        -- Merge může být chvíli disabled, dokud Lightroom nedokončí preview.
+        set merged to false
+        repeat 240 times
+            repeat with uiItem in (entire contents of front window)
+                try
+                    if (role of uiItem is "AXButton") and (name of uiItem is "Merge") then
+                        if enabled of uiItem then
+                            click uiItem
+                            set merged to true
+                            exit repeat
+                        end if
+                    end if
+                end try
+            end repeat
+            if merged then exit repeat
+            delay 0.25
+        end repeat
+
+        if merged is false then error "Merge button not found or disabled"
+    end tell
+end tell
+]]
+
+    if not writeFile(scriptPath, script) then
+        return 90
+    end
+
+    local command = '/usr/bin/osascript ' .. scriptPath .. ' >' .. logPath .. ' 2>&1'
     return LrTasks.execute(command)
 end
 
@@ -131,6 +292,16 @@ local function processQueue(showDialog)
         writeHeartbeat('empty-queue')
         return false
     end
+
+    local settings = loadHDRSettings()
+    writeHeartbeat(
+        'hdr-settings:' ..
+        'align=' .. tostring(settings.autoAlign) ..
+        ',auto=' .. tostring(settings.autoSettings) ..
+        ',deghost=' .. tostring(settings.deghost) ..
+        ',overlay=' .. tostring(settings.showDeghostOverlay) ..
+        ',stack=' .. tostring(settings.createStack)
+    )
 
     local catalog = LrApplication.activeCatalog()
     local missingPaths, seenMissing = {}, {}
@@ -198,7 +369,6 @@ local function processQueue(showDialog)
     writeHeartbeat('collection-added:' .. tostring(#sourcePhotos))
     LrTasks.yield()
 
-    -- Udělat kolekci skutečně viditelnou/aktivní v levém panelu Lightroomu.
     local okSource, sourceErr = LrTasks.pcall(function()
         catalog:setActiveSources({ collection })
     end)
@@ -214,26 +384,26 @@ local function processQueue(showDialog)
         if group.photos and #group.photos >= 2 then
             writeHeartbeat('hdr-selecting:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
             selectGroup(catalog, group.photos)
-            LrTasks.sleep(1.0)
+            LrTasks.sleep(0.8)
 
             local beforeIds = {}
             for _, photo in ipairs(catalog:getAllPhotos()) do
                 if photo.localIdentifier then beforeIds[photo.localIdentifier] = true end
             end
 
-            writeHeartbeat('hdr-triggering:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
-            local status = runHeadlessHDRMerge()
+            writeHeartbeat('hdr-dialog:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
+            local status = runHDRMerge(settings)
             if status ~= 0 then
-                local message = 'HDR zkratku se nepodařilo poslat (osascript exit ' .. tostring(status) .. '). Zkontroluj macOS Zpřístupnění pro Adobe Lightroom Classic.'
+                local message = 'HDR dialog automatizace selhala (osascript exit ' .. tostring(status) .. '). Zkontroluj /tmp/realityprocessor_hdr_osascript.log a macOS Zpřístupnění pro Lightroom.'
                 writeAck('ERROR: ' .. message)
-                writeHeartbeat('hdr-trigger-error:' .. tostring(groupIndex) .. ':exit-' .. tostring(status))
+                writeHeartbeat('hdr-ui-error:' .. tostring(groupIndex) .. ':exit-' .. tostring(status))
                 return false
             end
 
-            writeHeartbeat('hdr-command-sent:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
-            local newPhotos = waitForNewCatalogPhoto(catalog, beforeIds, 180, groupIndex, #manifest.groups)
+            writeHeartbeat('hdr-merge-clicked:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
+            local newPhotos = waitForNewCatalogPhoto(catalog, beforeIds, 240, groupIndex, #manifest.groups)
             if not newPhotos or #newPhotos == 0 then
-                local message = 'HDR merge série ' .. tostring(groupIndex) .. ' se do 180 s nedokončil. Zkratka byla odeslána, ale v katalogu nepřibyl nový snímek.'
+                local message = 'HDR merge série ' .. tostring(groupIndex) .. ' se do 240 s nedokončil.'
                 writeAck('ERROR: ' .. message)
                 writeHeartbeat('hdr-timeout:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
                 return false
