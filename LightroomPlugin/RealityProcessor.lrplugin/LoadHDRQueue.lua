@@ -3,6 +3,7 @@ local LrDialogs = import 'LrDialogs'
 local LrPathUtils = import 'LrPathUtils'
 local LrTasks = import 'LrTasks'
 local LrFileUtils = import 'LrFileUtils'
+local LrDate = import 'LrDate'
 
 local function homeDir()
     return '/Users/vojtechboura'
@@ -66,6 +67,76 @@ local function loadManifest(path)
     return manifest, nil
 end
 
+local function uniquePhotosFromGroups(groups)
+    local result = {}
+    local seen = {}
+
+    for _, group in ipairs(groups or {}) do
+        for _, photo in ipairs(group.photos or {}) do
+            local id = photo.localIdentifier
+            if id and not seen[id] then
+                seen[id] = true
+                table.insert(result, photo)
+            end
+        end
+    end
+
+    return result
+end
+
+local function selectGroup(catalog, photos)
+    if not photos or #photos == 0 then
+        return false
+    end
+
+    local active = photos[1]
+    local others = {}
+    for i = 2, #photos do
+        table.insert(others, photos[i])
+    end
+
+    catalog:setSelectedPhotos(active, others)
+    return true
+end
+
+local function runHeadlessHDRMerge()
+    -- Lightroom Classic má na macOS pro headless HDR merge zkratku Control+Shift+H.
+    -- SDK samotné nemá API, kterým by šlo HDR merge spustit přímo, takže použijeme
+    -- systémovou klávesovou událost přes osascript/System Events.
+    local command = [[/usr/bin/osascript \
+-e 'tell application "Adobe Lightroom Classic" to activate' \
+-e 'delay 0.4' \
+-e 'tell application "System Events" to keystroke "h" using {control down, shift down}' \
+>/tmp/realityprocessor_hdr_osascript.log 2>&1]]
+
+    return LrTasks.execute(command)
+end
+
+local function waitForNewCatalogPhoto(catalog, beforeIds, timeoutSeconds, groupIndex, groupCount)
+    local deadline = LrDate.currentTime() + timeoutSeconds
+
+    while LrDate.currentTime() < deadline do
+        local allPhotos = catalog:getAllPhotos()
+        local newPhotos = {}
+
+        for _, photo in ipairs(allPhotos) do
+            local id = photo.localIdentifier
+            if id and not beforeIds[id] then
+                table.insert(newPhotos, photo)
+            end
+        end
+
+        if #newPhotos > 0 then
+            return newPhotos
+        end
+
+        writeHeartbeat('hdr-merging:' .. tostring(groupIndex) .. '/' .. tostring(groupCount))
+        LrTasks.sleep(0.5)
+    end
+
+    return nil
+end
+
 local function processQueue(showDialog)
     writeHeartbeat('loading-manifest')
 
@@ -106,9 +177,6 @@ local function processQueue(showDialog)
     if #missingPaths > 0 then
         writeHeartbeat('waiting-for-catalog-write')
 
-        -- Lightroom může ještě držet catalog write lock z vlastní importní operace.
-        -- Bez timeout parametrů withWriteAccessDo okamžitě spadne, i když se fotky mezitím
-        -- normálně importují. Proto na lock korektně počkáme až 30 sekund.
         catalog:withWriteAccessDo('Reality Processor import', function()
             for index, photoPath in ipairs(missingPaths) do
                 writeHeartbeat('importing:' .. tostring(index) .. '/' .. tostring(#missingPaths))
@@ -138,30 +206,101 @@ local function processQueue(showDialog)
 
     writeHeartbeat('groups-ready:' .. tostring(importedCount))
 
+    -- Vytvořit kolekci podle lokálního data a času Lightroomu.
+    local collectionName = 'RealityProcessor ' .. LrDate.timeToUserFormat(
+        LrDate.currentTime(),
+        '%Y-%m-%d %H-%M-%S',
+        false
+    )
+    local collection = nil
+
+    writeHeartbeat('creating-collection:' .. collectionName)
+    catalog:withWriteAccessDo('Reality Processor create collection', function()
+        collection = catalog:createCollection(collectionName, nil, true)
+    end, { timeout = 30 })
+
+    LrTasks.yield()
+
+    if not collection then
+        writeAck('ERROR: nepodařilo se vytvořit kolekci ' .. collectionName)
+        writeHeartbeat('collection-error')
+        return false
+    end
+
+    local sourcePhotos = uniquePhotosFromGroups(manifest.groups)
+    writeHeartbeat('adding-to-collection:' .. tostring(#sourcePhotos))
+    catalog:withWriteAccessDo('Reality Processor add source photos', function()
+        collection:addPhotos(sourcePhotos)
+    end, { timeout = 30 })
+
+    writeHeartbeat('collection-ready:' .. collectionName)
+    LrTasks.yield()
+
+    -- HDR merge po jedné sérii. Po každé sérii čekáme, až se v katalogu objeví nový DNG,
+    -- teprve potom spustíme další. Tím se Lightroom nepřetíží dávkou příkazů najednou.
+    local mergedCount = 0
+
+    for groupIndex, group in ipairs(manifest.groups) do
+        if group.photos and #group.photos >= 2 then
+            writeHeartbeat('hdr-selecting:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
+            selectGroup(catalog, group.photos)
+            LrTasks.sleep(0.3)
+
+            local beforeIds = {}
+            for _, photo in ipairs(catalog:getAllPhotos()) do
+                if photo.localIdentifier then
+                    beforeIds[photo.localIdentifier] = true
+                end
+            end
+
+            writeHeartbeat('hdr-triggering:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
+            local status = runHeadlessHDRMerge()
+            if status ~= 0 then
+                local message = 'Nepodařilo se spustit HDR merge přes macOS automatizaci (osascript exit ' .. tostring(status) .. '). Povol Adobe Lightroom Classic v Nastavení systému > Soukromí a zabezpečení > Zpřístupnění.'
+                writeAck('ERROR: ' .. message)
+                writeHeartbeat('hdr-trigger-error:' .. tostring(groupIndex))
+                return false
+            end
+
+            local newPhotos = waitForNewCatalogPhoto(catalog, beforeIds, 180, groupIndex, #manifest.groups)
+            if not newPhotos or #newPhotos == 0 then
+                local message = 'HDR merge série ' .. tostring(groupIndex) .. ' se do 180 s nedokončil.'
+                writeAck('ERROR: ' .. message)
+                writeHeartbeat('hdr-timeout:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
+                return false
+            end
+
+            mergedCount = mergedCount + 1
+            writeHeartbeat('hdr-created:' .. tostring(groupIndex) .. '/' .. tostring(#manifest.groups))
+
+            catalog:withWriteAccessDo('Reality Processor add HDR result', function()
+                collection:addPhotos(newPhotos)
+            end, { timeout = 30 })
+
+            LrTasks.sleep(0.5)
+        end
+    end
+
+    writeHeartbeat('selecting-collection')
+    -- Po dokončení vybereme první výsledek/zdroj pro jistotu, samotná kolekce už je připravená.
     local firstGroup = manifest.groups[1]
     if firstGroup and #firstGroup.photos > 0 then
-        writeHeartbeat('selecting-first-group')
-
-        local active = firstGroup.photos[1]
-        local others = {}
-        for i = 2, #firstGroup.photos do
-            table.insert(others, firstGroup.photos[i])
-        end
-
-        catalog:setSelectedPhotos(active, others)
-        writeHeartbeat('selection-complete')
-    else
-        writeHeartbeat('selection-skipped')
+        selectGroup(catalog, firstGroup.photos)
     end
 
     writeHeartbeat('writing-ack')
-    writeAck('OK|' .. tostring(#manifest.groups) .. '|' .. tostring(importedCount))
+    writeAck(
+        'OK|' .. tostring(#manifest.groups) ..
+        '|' .. tostring(importedCount) ..
+        '|' .. tostring(mergedCount) ..
+        '|' .. collectionName
+    )
     writeHeartbeat('processed')
 
     if showDialog then
         LrDialogs.message(
             'Reality Processor',
-            'Načteno ' .. tostring(#manifest.groups) .. ' HDR sérií (' .. tostring(importedCount) .. ' RAWů).\n\nPrvní série je vybraná.',
+            'Hotovo: ' .. tostring(mergedCount) .. ' HDR z ' .. tostring(#manifest.groups) .. ' sérií.\n\nKolekce: ' .. collectionName,
             'info'
         )
     end
