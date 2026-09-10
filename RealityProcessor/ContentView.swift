@@ -11,6 +11,8 @@ struct ContentView: View {
     @State private var statusMessage: String?
     @State private var isDropTargeted = false
     @State private var bracketMode: BracketMode = .automatic
+    @State private var currentProgress = "Připraveno"
+    @State private var debugLines: [String] = ["Připraveno."]
 
     private let scanner = PhotoScanner()
 
@@ -32,11 +34,11 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.14")
+                Text("HDR workflow · v0.15")
                     .foregroundStyle(.secondary)
             }
 
@@ -91,7 +93,7 @@ struct ContentView: View {
                 HStack {
                     if isPreparingLightroom { ProgressView().controlSize(.small) }
                     Label(
-                        isPreparingLightroom ? "Čekám na Lightroom…" : "Připravit Lightroom HDR",
+                        isPreparingLightroom ? "Pracuji s Lightroomem…" : "Připravit Lightroom HDR",
                         systemImage: "wand.and.rays"
                     )
                 }
@@ -101,21 +103,51 @@ struct ContentView: View {
             .controlSize(.large)
             .disabled(result?.brackets.isEmpty != false || isPreparingLightroom)
 
-            if let statusMessage {
-                Text(statusMessage)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            progressPanel
 
-            Spacer()
+            Spacer(minLength: 4)
 
-            Text("v0.14: delší čekání na import a diagnostika přesného stavu Lightroom bridge.")
+            Text("v0.15: live progress + debug Lightroom bridge.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
         .padding(20)
-        .frame(minWidth: 290)
+        .frame(minWidth: 310)
+    }
+
+    private var progressPanel: some View {
+        GroupBox("Průběh / debug") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    if isScanning || isPreparingLightroom {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: errorMessage == nil ? "checkmark.circle" : "exclamationmark.triangle")
+                    }
+
+                    Text(currentProgress)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(2)
+                }
+
+                Divider()
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(debugLines.suffix(8).enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .frame(height: 105)
+            }
+            .padding(.vertical, 3)
+        }
     }
 
     @ViewBuilder
@@ -140,7 +172,7 @@ struct ContentView: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 0) {
-                            ForEach(result.brackets, id: \BracketGroup.id) { group in
+                            ForEach(result.brackets, id: \.id) { group in
                                 BracketRow(group: group)
                                 Divider()
                             }
@@ -168,6 +200,8 @@ struct ContentView: View {
                 sourceFolder = folder
                 result = nil
                 statusMessage = nil
+                currentProgress = "Složka vybrána"
+                appendDebug("Vybrána složka: \(folder.lastPathComponent)")
                 return true
             } isTargeted: { targeted in
                 isDropTargeted = targeted
@@ -185,6 +219,10 @@ struct ContentView: View {
             sourceFolder = panel.url
             result = nil
             statusMessage = nil
+            if let url = panel.url {
+                currentProgress = "Složka vybrána"
+                appendDebug("Vybrána složka: \(url.lastPathComponent)")
+            }
         }
     }
 
@@ -193,17 +231,24 @@ struct ContentView: View {
         isScanning = true
         errorMessage = nil
         statusMessage = nil
+        currentProgress = "Načítám metadata a hledám HDR série…"
+        appendDebug("START analýzy · režim \(bracketMode.rawValue)")
+
         Task {
             do {
                 let scan = try await scanner.scan(folder: sourceFolder, mode: bracketMode)
                 await MainActor.run {
                     result = scan
                     isScanning = false
+                    currentProgress = "Analýza dokončena"
+                    appendDebug("DONE analýza · \(scan.allPhotos.count) fotek · \(scan.brackets.count) HDR · \(scan.ungrouped.count) mimo")
                 }
             } catch {
                 await MainActor.run {
                     errorMessage = error.localizedDescription
                     isScanning = false
+                    currentProgress = "Analýza selhala"
+                    appendDebug("ERROR analýza · \(error.localizedDescription)")
                 }
             }
         }
@@ -217,22 +262,48 @@ struct ContentView: View {
             _ = try LightroomBridge.writeManifest(for: result)
             isPreparingLightroom = true
             errorMessage = nil
+            currentProgress = "HDR fronta připravena"
             statusMessage = "HDR fronta připravena. Čekám, až ji Lightroom plugin převezme…"
+            appendDebug("START Lightroom · \(result.brackets.count) HDR sérií")
 
-            LightroomBridge.openAndWaitForPlugin { outcome in
-                DispatchQueue.main.async {
-                    isPreparingLightroom = false
-                    switch outcome {
-                    case .success(let detail):
-                        statusMessage = detail
-                    case .failure(let message):
-                        errorMessage = message
-                        statusMessage = "Lightroom frontu nedokončil."
+            LightroomBridge.openAndWaitForPlugin(
+                progress: { rawState in
+                    DispatchQueue.main.async {
+                        let readable = LightroomBridge.readableState(rawState)
+                        currentProgress = readable
+                        appendDebug("LR · \(rawState)")
+                    }
+                },
+                completion: { outcome in
+                    DispatchQueue.main.async {
+                        isPreparingLightroom = false
+                        switch outcome {
+                        case .success(let detail):
+                            statusMessage = detail
+                            currentProgress = "Lightroom dokončil import"
+                            appendDebug("DONE Lightroom · \(detail)")
+                        case .failure(let message):
+                            errorMessage = message
+                            statusMessage = "Lightroom frontu nedokončil."
+                            currentProgress = "Lightroom operaci nedokončil"
+                            appendDebug("ERROR Lightroom · \(message)")
+                        }
                     }
                 }
-            }
+            )
         } catch {
             errorMessage = error.localizedDescription
+            currentProgress = "Příprava Lightroomu selhala"
+            appendDebug("ERROR příprava · \(error.localizedDescription)")
+        }
+    }
+
+    private func appendDebug(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        debugLines.append("[\(formatter.string(from: Date()))] \(message)")
+        if debugLines.count > 80 {
+            debugLines.removeFirst(debugLines.count - 80)
         }
     }
 }
@@ -307,7 +378,10 @@ return {
         return manifestURL
     }
 
-    static func openAndWaitForPlugin(completion: @escaping (LightroomLaunchResult) -> Void) {
+    static func openAndWaitForPlugin(
+        progress: @escaping (String) -> Void,
+        completion: @escaping (LightroomLaunchResult) -> Void
+    ) {
         guard openLightroomClassic() else {
             completion(.failure("Adobe Lightroom Classic nebyl nalezen v Applications."))
             return
@@ -315,6 +389,7 @@ return {
 
         DispatchQueue.global(qos: .userInitiated).async {
             let deadline = Date().addingTimeInterval(60)
+            var lastHeartbeat: String?
 
             while Date() < deadline {
                 if let ack = try? String(contentsOf: ackURL, encoding: .utf8) {
@@ -331,17 +406,45 @@ return {
                         return
                     }
                 }
-                Thread.sleep(forTimeInterval: 0.5)
+
+                if let heartbeat = try? String(contentsOf: heartbeatURL, encoding: .utf8) {
+                    let text = heartbeat.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !text.isEmpty, text != lastHeartbeat {
+                        lastHeartbeat = text
+                        progress(text)
+                    }
+                }
+
+                Thread.sleep(forTimeInterval: 0.25)
             }
 
             let heartbeat = (try? String(contentsOf: heartbeatURL, encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             if let heartbeat, !heartbeat.isEmpty {
-                completion(.failure("Lightroom po 60 s operaci nedokončil. Poslední stav bridge: \(heartbeat). Pošli mi přesně tento stav."))
+                completion(.failure("Lightroom po 60 s operaci nedokončil. Poslední stav bridge: \(heartbeat)."))
             } else {
                 completion(.failure("Lightroom bridge se vůbec nespustil. Zkontroluj Reality Processor v Plug-in Manageru a dej Disable → Enable, případně Remove → Add."))
             }
+        }
+    }
+
+    static func readableState(_ raw: String) -> String {
+        switch raw {
+        case "started": return "Lightroom bridge spuštěn"
+        case "alive": return "Lightroom bridge čeká na frontu"
+        case "processing": return "Lightroom zpracovává HDR frontu"
+        case "importing": return "Lightroom importuje RAWy"
+        case "import-complete": return "Import RAWů dokončen"
+        case "rebuilding-groups": return "Sestavuji HDR skupiny v Lightroomu"
+        case "selecting-first-group": return "Vybírám první HDR sérii"
+        case "selection-complete": return "První HDR série vybrána"
+        case "writing-ack": return "Dokončuji předání do aplikace"
+        case "processed": return "Lightroom frontu dokončil"
+        default:
+            if raw.hasPrefix("processor-error:") { return "Chyba Lightroom pluginu" }
+            if raw.hasPrefix("trigger-delete-error:") { return "Chyba HDR triggeru" }
+            return "Lightroom: \(raw)"
         }
     }
 
