@@ -104,8 +104,11 @@ local function processQueue(showDialog)
     end
 
     if #missingPaths > 0 then
-        writeHeartbeat('importing:0/' .. tostring(#missingPaths))
+        writeHeartbeat('waiting-for-catalog-write')
 
+        -- Lightroom může ještě držet catalog write lock z vlastní importní operace.
+        -- Bez timeout parametrů withWriteAccessDo okamžitě spadne, i když se fotky mezitím
+        -- normálně importují. Proto na lock korektně počkáme až 30 sekund.
         catalog:withWriteAccessDo('Reality Processor import', function()
             for index, photoPath in ipairs(missingPaths) do
                 writeHeartbeat('importing:' .. tostring(index) .. '/' .. tostring(#missingPaths))
@@ -113,7 +116,7 @@ local function processQueue(showDialog)
                     catalog:addPhoto(photoPath)
                 end
             end
-        end)
+        end, { timeout = 30 })
     end
 
     writeHeartbeat('import-complete')
