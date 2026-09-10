@@ -67,9 +67,12 @@ local function loadManifest(path)
 end
 
 local function processQueue(showDialog)
+    writeHeartbeat('loading-manifest')
+
     local manifest, err = loadManifest(manifestPath())
     if not manifest then
         writeAck('ERROR: ' .. tostring(err))
+        writeHeartbeat('manifest-error:' .. tostring(err))
         if showDialog then
             LrDialogs.message('Reality Processor', 'HDR frontu se nepodařilo načíst.\n\n' .. tostring(err), 'critical')
         end
@@ -78,19 +81,19 @@ local function processQueue(showDialog)
 
     if not manifest.groups or #manifest.groups == 0 then
         writeAck('ERROR: empty queue')
+        writeHeartbeat('empty-queue')
         if showDialog then
             LrDialogs.message('Reality Processor', 'HDR fronta je prázdná.', 'warning')
         end
         return false
     end
 
-    writeHeartbeat('processing')
-
     local catalog = LrApplication.activeCatalog()
     local missingPaths = {}
     local seenMissing = {}
 
-    -- Sesbírat jen unikátní RAWy, které ještě nejsou v katalogu.
+    writeHeartbeat('scanning-catalog')
+
     for _, group in ipairs(manifest.groups) do
         for _, photoPath in ipairs(group.paths or {}) do
             if not catalog:findPhotoByPath(photoPath) and not seenMissing[photoPath] then
@@ -100,11 +103,12 @@ local function processQueue(showDialog)
         end
     end
 
-    -- Jeden write-access blok pro celý import. Trigger už je v této chvíli smazaný,
-    -- takže stejnou frontu watcher nemůže spustit znovu během importu.
     if #missingPaths > 0 then
+        writeHeartbeat('importing:0/' .. tostring(#missingPaths))
+
         catalog:withWriteAccessDo('Reality Processor import', function()
-            for _, photoPath in ipairs(missingPaths) do
+            for index, photoPath in ipairs(missingPaths) do
+                writeHeartbeat('importing:' .. tostring(index) .. '/' .. tostring(#missingPaths))
                 if not catalog:findPhotoByPath(photoPath) then
                     catalog:addPhoto(photoPath)
                 end
@@ -112,7 +116,12 @@ local function processQueue(showDialog)
         end)
     end
 
+    writeHeartbeat('import-complete')
+    LrTasks.yield()
+
     local importedCount = 0
+    writeHeartbeat('rebuilding-groups')
+
     for _, group in ipairs(manifest.groups) do
         group.photos = {}
         for _, photoPath in ipairs(group.paths or {}) do
@@ -124,16 +133,25 @@ local function processQueue(showDialog)
         end
     end
 
+    writeHeartbeat('groups-ready:' .. tostring(importedCount))
+
     local firstGroup = manifest.groups[1]
     if firstGroup and #firstGroup.photos > 0 then
+        writeHeartbeat('selecting-first-group')
+
         local active = firstGroup.photos[1]
         local others = {}
         for i = 2, #firstGroup.photos do
             table.insert(others, firstGroup.photos[i])
         end
+
         catalog:setSelectedPhotos(active, others)
+        writeHeartbeat('selection-complete')
+    else
+        writeHeartbeat('selection-skipped')
     end
 
+    writeHeartbeat('writing-ack')
     writeAck('OK|' .. tostring(#manifest.groups) .. '|' .. tostring(importedCount))
     writeHeartbeat('processed')
 
@@ -154,8 +172,8 @@ local function consumeTrigger()
         return false
     end
 
-    -- Trigger musí zmizet PŘED spuštěním importu. Když smazání selže,
-    -- frontu vůbec nespouštíme, jinak by se opakovala každou sekundu.
+    writeHeartbeat('trigger-received')
+
     local ok, err = LrTasks.pcall(function()
         LrFileUtils.delete(trigger)
     end)
@@ -166,6 +184,7 @@ local function consumeTrigger()
         return false
     end
 
+    writeHeartbeat('trigger-consumed')
     return true
 end
 
@@ -199,7 +218,3 @@ if not _G.RealityProcessorBridgeStarted then
         end
     end)
 end
-
--- Záměrně tu není druhý jednorázový startAsyncTask.
--- Předchozí verze měla watcher + jednorázové zpracování současně, takže při startu
--- pluginu mohly stejný trigger převzít dvě úlohy a import spustit dvakrát.
