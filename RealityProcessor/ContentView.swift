@@ -34,11 +34,11 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.15")
+                Text("HDR workflow · v0.16")
                     .foregroundStyle(.secondary)
             }
 
@@ -93,7 +93,7 @@ struct ContentView: View {
                 HStack {
                     if isPreparingLightroom { ProgressView().controlSize(.small) }
                     Label(
-                        isPreparingLightroom ? "Pracuji s Lightroomem…" : "Připravit Lightroom HDR",
+                        isPreparingLightroom ? "Zpracovávám HDR…" : "Připravit Lightroom HDR",
                         systemImage: "wand.and.rays"
                     )
                 }
@@ -103,16 +103,23 @@ struct ContentView: View {
             .controlSize(.large)
             .disabled(result?.brackets.isEmpty != false || isPreparingLightroom)
 
+            if let statusMessage {
+                Text(statusMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             progressPanel
 
             Spacer(minLength: 4)
 
-            Text("v0.15: live progress + debug Lightroom bridge.")
+            Text("v0.16: kolekce podle data/času + automatické HDR merge + live debug.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
         .padding(20)
-        .frame(minWidth: 310)
+        .frame(minWidth: 320)
     }
 
     private var progressPanel: some View {
@@ -120,8 +127,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     if isScanning || isPreparingLightroom {
-                        ProgressView()
-                            .controlSize(.small)
+                        ProgressView().controlSize(.small)
                     } else {
                         Image(systemName: errorMessage == nil ? "checkmark.circle" : "exclamationmark.triangle")
                     }
@@ -135,7 +141,7 @@ struct ContentView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(debugLines.suffix(8).enumerated()), id: \.offset) { _, line in
+                        ForEach(Array(debugLines.suffix(10).enumerated()), id: \.offset) { _, line in
                             Text(line)
                                 .font(.system(size: 10.5, design: .monospaced))
                                 .foregroundStyle(.secondary)
@@ -144,7 +150,7 @@ struct ContentView: View {
                         }
                     }
                 }
-                .frame(height: 105)
+                .frame(height: 125)
             }
             .padding(.vertical, 3)
         }
@@ -215,6 +221,7 @@ struct ContentView: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "Vybrat"
+
         if panel.runModal() == .OK {
             sourceFolder = panel.url
             result = nil
@@ -228,6 +235,7 @@ struct ContentView: View {
 
     private func analyze() {
         guard let sourceFolder else { return }
+
         isScanning = true
         errorMessage = nil
         statusMessage = nil
@@ -263,14 +271,13 @@ struct ContentView: View {
             isPreparingLightroom = true
             errorMessage = nil
             currentProgress = "HDR fronta připravena"
-            statusMessage = "HDR fronta připravena. Čekám, až ji Lightroom plugin převezme…"
+            statusMessage = "Importuji, vytvářím kolekci a skládám HDR série…"
             appendDebug("START Lightroom · \(result.brackets.count) HDR sérií")
 
             LightroomBridge.openAndWaitForPlugin(
                 progress: { rawState in
                     DispatchQueue.main.async {
-                        let readable = LightroomBridge.readableState(rawState)
-                        currentProgress = readable
+                        currentProgress = LightroomBridge.readableState(rawState)
                         appendDebug("LR · \(rawState)")
                     }
                 },
@@ -280,11 +287,11 @@ struct ContentView: View {
                         switch outcome {
                         case .success(let detail):
                             statusMessage = detail
-                            currentProgress = "Lightroom dokončil import"
+                            currentProgress = "HDR zpracování dokončeno"
                             appendDebug("DONE Lightroom · \(detail)")
                         case .failure(let message):
                             errorMessage = message
-                            statusMessage = "Lightroom frontu nedokončil."
+                            statusMessage = "Lightroom workflow nedokončil."
                             currentProgress = "Lightroom operaci nedokončil"
                             appendDebug("ERROR Lightroom · \(message)")
                         }
@@ -302,8 +309,8 @@ struct ContentView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
         debugLines.append("[\(formatter.string(from: Date()))] \(message)")
-        if debugLines.count > 80 {
-            debugLines.removeFirst(debugLines.count - 80)
+        if debugLines.count > 120 {
+            debugLines.removeFirst(debugLines.count - 120)
         }
     }
 }
@@ -365,7 +372,7 @@ private enum LightroomBridge {
 
         let lua = """
 return {
-    version = 3,
+    version = 4,
     createdAt = \(luaString(ISO8601DateFormatter().string(from: Date()))),
     groups = {
 \(groupBlocks)
@@ -388,19 +395,24 @@ return {
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let deadline = Date().addingTimeInterval(60)
+            // HDR merge může u větší zakázky trvat několik minut.
+            let deadline = Date().addingTimeInterval(30 * 60)
             var lastHeartbeat: String?
 
             while Date() < deadline {
                 if let ack = try? String(contentsOf: ackURL, encoding: .utf8) {
                     let text = ack.trimmingCharacters(in: .whitespacesAndNewlines)
+
                     if text.hasPrefix("OK|") {
-                        let parts = text.split(separator: "|")
+                        let parts = text.split(separator: "|", omittingEmptySubsequences: false)
                         let groups = parts.count > 1 ? String(parts[1]) : "?"
                         let raws = parts.count > 2 ? String(parts[2]) : "?"
-                        completion(.success("Lightroom převzal frontu: \(groups) HDR sérií / \(raws) RAWů. První série je vybraná."))
+                        let merged = parts.count > 3 ? String(parts[3]) : "?"
+                        let collection = parts.count > 4 ? String(parts[4]) : "?"
+                        completion(.success("Hotovo: \(merged)/\(groups) HDR · \(raws) RAWů · kolekce \(collection)"))
                         return
                     }
+
                     if text.hasPrefix("ERROR:") {
                         completion(.failure("Lightroom plugin vrátil chybu: \(text)"))
                         return
@@ -421,11 +433,7 @@ return {
             let heartbeat = (try? String(contentsOf: heartbeatURL, encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
-            if let heartbeat, !heartbeat.isEmpty {
-                completion(.failure("Lightroom po 60 s operaci nedokončil. Poslední stav bridge: \(heartbeat)."))
-            } else {
-                completion(.failure("Lightroom bridge se vůbec nespustil. Zkontroluj Reality Processor v Plug-in Manageru a dej Disable → Enable, případně Remove → Add."))
-            }
+            completion(.failure("Lightroom workflow se do 30 minut nedokončil. Poslední stav: \(heartbeat ?? "bez heartbeat")"))
         }
     }
 
@@ -433,17 +441,45 @@ return {
         switch raw {
         case "started": return "Lightroom bridge spuštěn"
         case "alive": return "Lightroom bridge čeká na frontu"
-        case "processing": return "Lightroom zpracovává HDR frontu"
-        case "importing": return "Lightroom importuje RAWy"
+        case "loading-manifest": return "Načítám HDR frontu"
+        case "scanning-catalog": return "Kontroluji Lightroom katalog"
+        case "waiting-for-catalog-write": return "Čekám na uvolnění katalogu"
         case "import-complete": return "Import RAWů dokončen"
-        case "rebuilding-groups": return "Sestavuji HDR skupiny v Lightroomu"
-        case "selecting-first-group": return "Vybírám první HDR sérii"
-        case "selection-complete": return "První HDR série vybrána"
-        case "writing-ack": return "Dokončuji předání do aplikace"
-        case "processed": return "Lightroom frontu dokončil"
+        case "rebuilding-groups": return "Sestavuji HDR skupiny"
+        case "writing-ack": return "Dokončuji workflow"
+        case "processed": return "Lightroom workflow dokončen"
+        case "selecting-collection": return "Dokončuji výběr v Lightroomu"
         default:
-            if raw.hasPrefix("processor-error:") { return "Chyba Lightroom pluginu" }
-            if raw.hasPrefix("trigger-delete-error:") { return "Chyba HDR triggeru" }
+            if raw.hasPrefix("importing:") {
+                return "Importuji RAWy \(raw.replacingOccurrences(of: "importing:", with: ""))"
+            }
+            if raw.hasPrefix("groups-ready:") {
+                return "HDR skupiny připravené (\(raw.replacingOccurrences(of: "groups-ready:", with: "")) RAWů)"
+            }
+            if raw.hasPrefix("creating-collection:") {
+                return "Vytvářím kolekci"
+            }
+            if raw.hasPrefix("adding-to-collection:") {
+                return "Přidávám fotky do kolekce"
+            }
+            if raw.hasPrefix("collection-ready:") {
+                return "Kolekce vytvořena"
+            }
+            if raw.hasPrefix("hdr-selecting:") {
+                return "Připravuji HDR sérii \(raw.replacingOccurrences(of: "hdr-selecting:", with: ""))"
+            }
+            if raw.hasPrefix("hdr-triggering:") {
+                return "Spouštím HDR merge \(raw.replacingOccurrences(of: "hdr-triggering:", with: ""))"
+            }
+            if raw.hasPrefix("hdr-merging:") {
+                return "Lightroom skládá HDR \(raw.replacingOccurrences(of: "hdr-merging:", with: ""))"
+            }
+            if raw.hasPrefix("hdr-created:") {
+                return "HDR vytvořeno \(raw.replacingOccurrences(of: "hdr-created:", with: ""))"
+            }
+            if raw.hasPrefix("hdr-timeout:") || raw.hasPrefix("hdr-trigger-error:") || raw.hasPrefix("processor-error:") {
+                return "Chyba při HDR zpracování"
+            }
             return "Lightroom: \(raw)"
         }
     }
