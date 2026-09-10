@@ -34,11 +34,11 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("REALITY PROCESSOR")
                     .font(.title2.bold())
-                Text("HDR workflow · v0.16")
+                Text("HDR workflow · v0.17")
                     .foregroundStyle(.secondary)
             }
 
@@ -93,7 +93,7 @@ struct ContentView: View {
                 HStack {
                     if isPreparingLightroom { ProgressView().controlSize(.small) }
                     Label(
-                        isPreparingLightroom ? "Zpracovávám HDR…" : "Připravit Lightroom HDR",
+                        isPreparingLightroom ? "Pracuji s Lightroomem…" : "Připravit Lightroom HDR",
                         systemImage: "wand.and.rays"
                     )
                 }
@@ -103,23 +103,16 @@ struct ContentView: View {
             .controlSize(.large)
             .disabled(result?.brackets.isEmpty != false || isPreparingLightroom)
 
-            if let statusMessage {
-                Text(statusMessage)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
             progressPanel
 
             Spacer(minLength: 4)
 
-            Text("v0.16: kolekce podle data/času + automatické HDR merge + live debug.")
+            Text("v0.17: kolekce + robustnější headless HDR merge.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
         .padding(20)
-        .frame(minWidth: 320)
+        .frame(minWidth: 310)
     }
 
     private var progressPanel: some View {
@@ -141,7 +134,7 @@ struct ContentView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(debugLines.suffix(10).enumerated()), id: \.offset) { _, line in
+                        ForEach(Array(debugLines.suffix(8).enumerated()), id: \.offset) { _, line in
                             Text(line)
                                 .font(.system(size: 10.5, design: .monospaced))
                                 .foregroundStyle(.secondary)
@@ -150,7 +143,7 @@ struct ContentView: View {
                         }
                     }
                 }
-                .frame(height: 125)
+                .frame(height: 105)
             }
             .padding(.vertical, 3)
         }
@@ -221,7 +214,6 @@ struct ContentView: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "Vybrat"
-
         if panel.runModal() == .OK {
             sourceFolder = panel.url
             result = nil
@@ -235,7 +227,6 @@ struct ContentView: View {
 
     private func analyze() {
         guard let sourceFolder else { return }
-
         isScanning = true
         errorMessage = nil
         statusMessage = nil
@@ -354,6 +345,11 @@ private enum LightroomBridge {
             return "\"\(escaped)\""
         }
 
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH-mm-ss"
+        let collectionName = "RealityProcessor \(formatter.string(from: Date()))"
+
         let groupBlocks = result.brackets.enumerated().map { index, group in
             let paths = group.photos
                 .map { luaString($0.url.path(percentEncoded: false)) }
@@ -372,8 +368,9 @@ private enum LightroomBridge {
 
         let lua = """
 return {
-    version = 4,
+    version = 5,
     createdAt = \(luaString(ISO8601DateFormatter().string(from: Date()))),
+    collectionName = \(luaString(collectionName)),
     groups = {
 \(groupBlocks)
     }
@@ -395,14 +392,12 @@ return {
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // HDR merge může u větší zakázky trvat několik minut.
             let deadline = Date().addingTimeInterval(30 * 60)
             var lastHeartbeat: String?
 
             while Date() < deadline {
                 if let ack = try? String(contentsOf: ackURL, encoding: .utf8) {
                     let text = ack.trimmingCharacters(in: .whitespacesAndNewlines)
-
                     if text.hasPrefix("OK|") {
                         let parts = text.split(separator: "|", omittingEmptySubsequences: false)
                         let groups = parts.count > 1 ? String(parts[1]) : "?"
@@ -412,7 +407,6 @@ return {
                         completion(.success("Hotovo: \(merged)/\(groups) HDR · \(raws) RAWů · kolekce \(collection)"))
                         return
                     }
-
                     if text.hasPrefix("ERROR:") {
                         completion(.failure("Lightroom plugin vrátil chybu: \(text)"))
                         return
@@ -426,61 +420,43 @@ return {
                         progress(text)
                     }
                 }
-
                 Thread.sleep(forTimeInterval: 0.25)
             }
 
             let heartbeat = (try? String(contentsOf: heartbeatURL, encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-
-            completion(.failure("Lightroom workflow se do 30 minut nedokončil. Poslední stav: \(heartbeat ?? "bez heartbeat")"))
+            if let heartbeat, !heartbeat.isEmpty {
+                completion(.failure("Lightroom po 30 minutách workflow nedokončil. Poslední stav: \(heartbeat)."))
+            } else {
+                completion(.failure("Lightroom bridge se vůbec nespustil."))
+            }
         }
     }
 
     static func readableState(_ raw: String) -> String {
+        if raw.hasPrefix("creating-collection:") { return "Vytvářím kolekci v Lightroomu" }
+        if raw.hasPrefix("collection-added:") { return "Zdrojové fotky jsou v kolekci" }
+        if raw.hasPrefix("collection-active:") { return "Kolekce je aktivní" }
+        if raw.hasPrefix("collection-active-warning:") { return "Kolekce existuje, ale nepodařilo se ji aktivovat" }
+        if raw.hasPrefix("hdr-selecting:") { return "Vybírám další HDR sérii" }
+        if raw.hasPrefix("hdr-triggering:") { return "Spouštím headless HDR merge" }
+        if raw.hasPrefix("hdr-command-sent:") { return "HDR příkaz odeslán do Lightroomu" }
+        if raw.hasPrefix("hdr-merging:") { return "Lightroom skládá HDR…" }
+        if raw.hasPrefix("hdr-created:") { return "HDR vytvořeno" }
+        if raw.hasPrefix("hdr-trigger-error:") { return "Nepodařilo se spustit HDR zkratku" }
+        if raw.hasPrefix("hdr-timeout:") { return "HDR merge se zasekl" }
         switch raw {
         case "started": return "Lightroom bridge spuštěn"
         case "alive": return "Lightroom bridge čeká na frontu"
         case "loading-manifest": return "Načítám HDR frontu"
         case "scanning-catalog": return "Kontroluji Lightroom katalog"
-        case "waiting-for-catalog-write": return "Čekám na uvolnění katalogu"
+        case "waiting-for-catalog-write": return "Čekám na zápis do Lightroom katalogu"
         case "import-complete": return "Import RAWů dokončen"
         case "rebuilding-groups": return "Sestavuji HDR skupiny"
+        case "collection-final-active": return "Hotová kolekce je otevřená"
         case "writing-ack": return "Dokončuji workflow"
-        case "processed": return "Lightroom workflow dokončen"
-        case "selecting-collection": return "Dokončuji výběr v Lightroomu"
-        default:
-            if raw.hasPrefix("importing:") {
-                return "Importuji RAWy \(raw.replacingOccurrences(of: "importing:", with: ""))"
-            }
-            if raw.hasPrefix("groups-ready:") {
-                return "HDR skupiny připravené (\(raw.replacingOccurrences(of: "groups-ready:", with: "")) RAWů)"
-            }
-            if raw.hasPrefix("creating-collection:") {
-                return "Vytvářím kolekci"
-            }
-            if raw.hasPrefix("adding-to-collection:") {
-                return "Přidávám fotky do kolekce"
-            }
-            if raw.hasPrefix("collection-ready:") {
-                return "Kolekce vytvořena"
-            }
-            if raw.hasPrefix("hdr-selecting:") {
-                return "Připravuji HDR sérii \(raw.replacingOccurrences(of: "hdr-selecting:", with: ""))"
-            }
-            if raw.hasPrefix("hdr-triggering:") {
-                return "Spouštím HDR merge \(raw.replacingOccurrences(of: "hdr-triggering:", with: ""))"
-            }
-            if raw.hasPrefix("hdr-merging:") {
-                return "Lightroom skládá HDR \(raw.replacingOccurrences(of: "hdr-merging:", with: ""))"
-            }
-            if raw.hasPrefix("hdr-created:") {
-                return "HDR vytvořeno \(raw.replacingOccurrences(of: "hdr-created:", with: ""))"
-            }
-            if raw.hasPrefix("hdr-timeout:") || raw.hasPrefix("hdr-trigger-error:") || raw.hasPrefix("processor-error:") {
-                return "Chyba při HDR zpracování"
-            }
-            return "Lightroom: \(raw)"
+        case "processed": return "Workflow dokončeno"
+        default: return "Lightroom: \(raw)"
         }
     }
 
@@ -491,17 +467,14 @@ return {
             "/Applications/Adobe Lightroom Classic/Adobe Lightroom Classic.app",
             "/Applications/Adobe Lightroom Classic.app"
         ]
-
         for path in candidates where FileManager.default.fileExists(atPath: path) {
             workspace.openApplication(at: URL(fileURLWithPath: path), configuration: .init())
             return true
         }
-
         if let appURL = workspace.urlForApplication(withBundleIdentifier: "com.adobe.LightroomClassicCC7") {
             workspace.openApplication(at: appURL, configuration: .init())
             return true
         }
-
         return false
     }
 }
@@ -513,8 +486,7 @@ private struct BracketRow: View {
         HStack {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
-                    Text(group.title)
-                        .fontWeight(.medium)
+                    Text(group.title).fontWeight(.medium)
                     Text(group.presetName)
                         .font(.caption2.weight(.semibold))
                         .padding(.horizontal, 6)
@@ -527,8 +499,7 @@ private struct BracketRow: View {
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 4) {
-                Text("\(Int(group.confidence * 100)) %")
-                    .fontWeight(.semibold)
+                Text("\(Int(group.confidence * 100)) %").fontWeight(.semibold)
                 Text(group.confidence >= 0.90 ? "Jistá série" : "Zkontrolovat")
                     .font(.caption)
                     .foregroundStyle(group.confidence >= 0.90 ? Color.secondary : Color.orange)
@@ -546,15 +517,10 @@ private struct StatCard: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.title2)
-                .frame(width: 32)
+            Image(systemName: icon).font(.title2).frame(width: 32)
             VStack(alignment: .leading, spacing: 2) {
-                Text(value)
-                    .font(.title2.bold())
-                Text(title)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(value).font(.title2.bold())
+                Text(title).font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(14)
